@@ -70,10 +70,17 @@ pub(crate) fn chart_of(surface: &SurfaceGeometry, p: Point) -> Option<ogeom_math
 /// when it lands convincingly *on* the surface (the same bar the denser
 /// reseed is judged against), so a guess that wandered into the wrong
 /// basin, or a first sample with no predecessor, still pays for the grid.
+///
+/// The seed comes with how far its own sample sat off the surface. A file
+/// whose edges all sit a little off their patch (quantised exports carry
+/// a hundredth of a millimetre or more) would otherwise fail the bar at
+/// every sample and pay two grid searches for each: a landing as close as
+/// its neighbour's, within twice it, is that same slop and is believed,
+/// the bar the interval probes already hold a landing to.
 fn land(
     surface: &SurfaceGeometry,
     p: Point,
-    seed: Option<ogeom_math::Point2>,
+    seed: Option<(ogeom_math::Point2, f64)>,
     tol: Tolerances,
 ) -> OgeomResult<(ogeom_math::Point2, f64)> {
     if let Some(uv) = chart_of(surface, p) {
@@ -96,10 +103,14 @@ fn land(
         }
         return Ok((uv, off));
     }
-    let near = seed.and_then(|luv| {
-        crate::measure::project_on_surface_from(surface, p, (luv.x, luv.y), tol).ok()
+    let near = seed.and_then(|(luv, seed_off)| {
+        crate::measure::project_on_surface_from(surface, p, (luv.x, luv.y), tol)
+            .ok()
+            .map(|f| (f, seed_off))
     });
-    if let Some(close) = near.filter(|f| f.distance <= tol.confusion() * 1e5) {
+    if let Some((close, _)) = near.filter(|(f, seed_off)| {
+        f.distance <= (tol.confusion() * 1e5).max(2.0 * seed_off)
+    }) {
         return Ok((
             ogeom_math::Point2::new(close.parameters.0, close.parameters.1),
             close.distance,
@@ -225,13 +236,13 @@ pub fn fit_projected_pcurve_aimed(
     let mut trace = Vec::with_capacity(SAMPLES + 1);
     let mut points = Vec::with_capacity(SAMPLES + 1);
     let mut offs = Vec::with_capacity(SAMPLES + 1);
-    let mut previous: Option<(Point, ogeom_math::Point2)> = None;
+    let mut previous: Option<(ogeom_math::Point2, f64)> = None;
     for i in 0..=SAMPLES {
         #[allow(clippy::cast_precision_loss)]
         let t = range.0 + (range.1 - range.0) * i as f64 / SAMPLES as f64;
         let p = curve.point_at(t, tol)?;
-        let (uv, off) = land(surface, p, previous.map(|(_, luv)| luv), tol)?;
-        previous = Some((p, uv));
+        let (uv, off) = land(surface, p, previous, tol)?;
+        previous = Some((uv, off));
         parameters.push(t);
         trace.push(uv);
         points.push(p);
@@ -459,7 +470,7 @@ pub fn fit_projected_pcurve_aimed(
             let before = trace[index - 1];
             let after = trace[index];
             let p = curve.point_at(tm, tol).ok()?;
-            let (mut uv, off) = land(surface, p, Some(before), tol).ok()?;
+            let (mut uv, off) = land(surface, p, Some((before, offs[index - 1])), tol).ok()?;
             if spans.0 > 0.0 {
                 while uv.x - before.x > spans.0 * 0.5 {
                     uv.x -= spans.0;

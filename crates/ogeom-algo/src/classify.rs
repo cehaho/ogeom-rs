@@ -1675,6 +1675,14 @@ impl SolidBoundary {
             ..Deflection::default()
         };
         let reach = tol.confusion();
+        // Every face's rings first, in the order the walk below draws them:
+        // they are kept, refusal included, so a boundary one of whose faces
+        // cannot be drawn (an edge with no pcurve on it) refuses here at
+        // once, on every probe after the first, instead of after meshing
+        // every face before that one, again for each probe.
+        for prepared in faces {
+            prepared.rings(model, ring_deflection, tol)?;
+        }
         // Each face's own nearest point, inside its trim and clear of it,
         // nearest first: the face's index, the distance, the point in
         // world space, the face's chart point and its normal there.
