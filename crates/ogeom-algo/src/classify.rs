@@ -415,6 +415,10 @@ struct PreparedFace {
     /// The rings drawn ten times finer, for a ray that meets the face
     /// near its trim (see [`PreparedFace::fine_rings`]).
     fine_rings: std::sync::OnceLock<OgeomResult<Rings>>,
+    /// The face meshed at the ring chord, for the places a ray
+    /// can aim at inside it (see [`SolidBoundary::reached`]), drawn the
+    /// first time a probe needs it and kept for the next.
+    aims: std::sync::OnceLock<Option<ogeom_topo::Triangulation>>,
     /// The face's surface in the model's store, under which rays cast
     /// against it are kept.
     surface: ogeom_topo::SurfaceId,
@@ -1075,6 +1079,7 @@ impl SolidBoundary {
                 face: face.clone(),
                 rings: std::sync::OnceLock::new(),
                 fine_rings: std::sync::OnceLock::new(),
+                aims: std::sync::OnceLock::new(),
                 surface: data.surface,
                 bound,
                 own,
@@ -1698,8 +1703,17 @@ impl SolidBoundary {
             if let Ok(found) = project_on_surface(surface, local, 16, tol) {
                 aims.push(found.parameters);
             }
-            if let Ok(mesh) =
-                ogeom_mesh::triangulate_face(model, &prepared.face, ring_deflection, tol)
+            // Meshed at the ring chord once and kept: drawn again for every
+            // probe, a curved face's mesh of hundreds of thousands of
+            // triangles cost more than the walk. A coarser mesh would aim
+            // elsewhere and change what the probe reaches: a drafted drum
+            // meeting a wall was refused with aims from the default one.
+            if let Some(mesh) = prepared
+                .aims
+                .get_or_init(|| {
+                    ogeom_mesh::triangulate_face(model, &prepared.face, ring_deflection, tol).ok()
+                })
+                .as_ref()
                 && mesh.has_parameters()
             {
                 let mut middles: Vec<(f64, (f64, f64))> = mesh
