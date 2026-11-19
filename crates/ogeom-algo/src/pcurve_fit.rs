@@ -108,9 +108,9 @@ fn land(
             .ok()
             .map(|f| (f, seed_off))
     });
-    if let Some((close, _)) = near.filter(|(f, seed_off)| {
-        f.distance <= (tol.confusion() * 1e5).max(2.0 * seed_off)
-    }) {
+    if let Some((close, _)) =
+        near.filter(|(f, seed_off)| f.distance <= (tol.confusion() * 1e5).max(2.0 * seed_off))
+    {
         return Ok((
             ogeom_math::Point2::new(close.parameters.0, close.parameters.1),
             close.distance,
@@ -617,7 +617,9 @@ pub fn fit_projected_pcurve_aimed(
         f64,
         usize,
     )> = None;
+    const STALE: usize = 2;
     let mut round = 0;
+    let mut stale = 0;
     loop {
         let (at_samples, between, more) = deviation(&fitted, &parameters, &trace, &offs);
         // The best round stands, whichever it was: a refit is not obliged
@@ -627,8 +629,16 @@ pub fn fit_projected_pcurve_aimed(
             .is_none_or(|(_, a, b, _)| at_samples.max(between) < a.max(*b))
         {
             best = Some((fitted.clone(), at_samples, between, parameters.len()));
+            stale = 0;
+        } else {
+            stale += 1;
         }
-        if more.is_empty() || round == DENSIFY || parameters.len() >= MOST {
+        // Two refits in a row no closer than the best end the doubling. A
+        // round may pass through a worse fit on its way to a closer one (a
+        // drop the samples straddle), but where the trace is the file's
+        // slop rather than a curve the fit has yet to reach, every further
+        // round costs twice the last for a fit no closer than one in hand.
+        if more.is_empty() || round == DENSIFY || parameters.len() >= MOST || stale >= STALE {
             break;
         }
         for (tm, p, uv, off) in more {
