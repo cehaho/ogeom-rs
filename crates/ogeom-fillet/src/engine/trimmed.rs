@@ -4127,9 +4127,14 @@ fn assemble_widened(
                                 let k = if let Some(k) = made.get(&key) {
                                     *k
                                 } else {
-                                    let (lo, hi) = c.domain();
-                                    let starts_at_a = c.point_at(lo, tol)?.distance(a.1)
-                                        <= c.point_at(lo, tol)?.distance(z.1);
+                                    // The run's whole contact, or the part
+                                    // of it a closed rim's corner cuts off.
+                                    let (ta, tz) = (
+                                        param_on(c, c.domain(), a.1, tol)?,
+                                        param_on(c, c.domain(), z.1, tol)?,
+                                    );
+                                    let (lo, hi) = (ta.min(tz), ta.max(tz));
+                                    let starts_at_a = ta <= tz;
                                     edges.push(SheetCurve {
                                         ends: if starts_at_a { (ia, iz) } else { (iz, ia) },
                                         curve: c.clone(),
@@ -4263,18 +4268,28 @@ fn assemble_widened(
     // The faces each rolled strip's pieces after its first take, appended
     // after every other face, with the strip's index.
     let mut rolled_faces: Vec<(usize, SheetRings)> = Vec::new();
+    // Which run each of those is, by its index in `rolled`, where it is a
+    // run's piece rather than the strip's own.
+    let mut rolled_runs: Vec<Option<usize>> = Vec::new();
     for b in bevels {
         let e = &curved.edges[&b.edge];
         // A rolled strip: its pieces either side of its run, each between
         // its faces, and the run's piece, the ball on the edge.
         if let Some(r) = rolled.iter().find(|r| bevels[r.strip].edge == b.edge) {
-            if rolled.iter().filter(|q| q.strip == r.strip).count() != 1 {
+            // The strip's runs, in the order its contact meets them. An
+            // open edge's strip takes one run, between the pieces at its
+            // two ends; a closed rim's any number, each two in a row
+            // joined by the strip's own piece between them.
+            let runs: Vec<(usize, &RolledRun)> = rolled
+                .iter()
+                .enumerate()
+                .filter(|(_, q)| q.strip == r.strip)
+                .collect();
+            let closed = e.ends.0 == e.ends.1;
+            if (runs.len() != 1 && !closed) || runs.iter().any(|(_, q)| q.side != r.side) {
                 return Ok(None);
             }
             let (left, other) = (b.faces[r.side], b.faces[1 - r.side]);
-            let (Some(&q0), Some(&q1)) = (r.run.feet.first(), r.run.feet.last()) else {
-                return Ok(None);
-            };
             let walked = |fi: usize, k: usize| -> Option<bool> {
                 face_walks(&rings_of[fi], k).or_else(|| {
                     split_faces
@@ -4287,84 +4302,155 @@ fn assemble_widened(
                 let (i, j) = (points.index(a), points.index(z));
                 Key::Piece(owner, edge, i.min(j), i.max(j))
             };
+            // The pieces of face `fi`'s contact from `a` to `z`: one, or
+            // two where the face's corner at a closed rim's vertex cuts it
+            // between.
+            let contact_pieces = |fi: usize,
+                                  a: Point,
+                                  z: Point,
+                                  points: &mut Points,
+                                  made: &FastMap<Key, usize>|
+             -> OgeomResult<Option<Vec<usize>>> {
+                if let Some(&k) = made.get(&piece_key(fi, b.edge, a, z, points)) {
+                    return Ok(Some(vec![k]));
+                }
+                if !closed {
+                    return Ok(None);
+                }
+                for start in [true, false] {
+                    let Some(c) = corner_for(corners, curved, fi, e.ends.0, b.edge, start, tol)?
+                    else {
+                        continue;
+                    };
+                    if let (Some(&k0), Some(&k1)) = (
+                        made.get(&piece_key(fi, b.edge, a, c.point, points)),
+                        made.get(&piece_key(fi, b.edge, c.point, z, points)),
+                    ) {
+                        return Ok(Some(vec![k0, k1]));
+                    }
+                }
+                Ok(None)
+            };
             let mut rings: Vec<Vec<(usize, bool)>> = Vec::with_capacity(3);
-            // The pieces between the faces, at each end of the edge.
-            for (end, v) in [e.ends.0, e.ends.1].into_iter().enumerate() {
-                let (Some(cl), Some(co)) = (
-                    corner_for(corners, curved, left, v, b.edge, end == 0, tol)?,
-                    corner_for(corners, curved, other, v, b.edge, end == 0, tol)?,
-                ) else {
+            if closed {
+                // The strip's pieces between its runs: from where one run's
+                // contact comes back to where the next one's leaves.
+                for (i, (_, here)) in runs.iter().enumerate() {
+                    let next = runs[(i + 1) % runs.len()].1;
+                    let (Some(&q1), Some(&q0)) = (here.run.feet.last(), next.run.feet.first())
+                    else {
+                        return Ok(None);
+                    };
+                    let (p1, p0) = (here.leave.point, next.enter.point);
+                    let (Some(kl), Some(ko)) = (
+                        contact_pieces(left, p1, p0, &mut points, &made)?,
+                        contact_pieces(other, q1, q0, &mut points, &made)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let back = section(&mut points, &mut edges, &mut made, b, None, p1, q1)?;
+                    let on = section(&mut points, &mut edges, &mut made, b, None, p0, q0)?;
+                    let Some(wl) = walked(left, kl[0]) else {
+                        return Ok(None);
+                    };
+                    let mut rest: Vec<usize> = kl[1..].to_vec();
+                    rest.extend(&ko);
+                    rest.extend([back.0, on.0]);
+                    let Some(ring) = chained_ring(&edges, (kl[0], !wl), &rest) else {
+                        return Ok(None);
+                    };
+                    rings.push(ring);
+                }
+            } else {
+                let (Some(&q0), Some(&q1)) = (r.run.feet.first(), r.run.feet.last()) else {
                     return Ok(None);
                 };
-                // The crossing on this end's side: the one nearer its corner
-                // along the contact.
-                let c = &b.contacts[r.side];
-                let tc = param_on(c, c.domain(), cl.point, tol)?;
-                let period = period_of(c, tol);
-                let gap = |t: f64| {
-                    let d = t - tc;
-                    period.map_or(d.abs(), |p| {
-                        let d = d.rem_euclid(p);
-                        d.min(p - d)
-                    })
-                };
-                let (p, q) = if gap(r.enter.at) <= gap(r.leave.at) {
-                    (r.enter.point, q0)
-                } else {
-                    (r.leave.point, q1)
-                };
-                let (a, z) = (cl.point, co.point);
-                let key_l = piece_key(left, b.edge, a, p, &mut points);
-                let key_o = piece_key(other, b.edge, z, q, &mut points);
-                let (Some(&kl), Some(&ko)) = (made.get(&key_l), made.get(&key_o)) else {
-                    return Ok(None);
-                };
-                let switch = section(&mut points, &mut edges, &mut made, b, None, p, q)?;
-                let cut = cut_at(b, v, a, z);
-                let capped = section(&mut points, &mut edges, &mut made, b, cut.as_ref(), z, a)?;
-                let Some(wl) = walked(left, kl) else {
-                    return Ok(None);
-                };
-                let Some(ring) = chained_ring(&edges, (kl, !wl), &[ko, switch.0, capped.0]) else {
-                    return Ok(None);
-                };
-                rings.push(ring);
+                // The pieces between the faces, at each end of the edge.
+                for (end, v) in [e.ends.0, e.ends.1].into_iter().enumerate() {
+                    let (Some(cl), Some(co)) = (
+                        corner_for(corners, curved, left, v, b.edge, end == 0, tol)?,
+                        corner_for(corners, curved, other, v, b.edge, end == 0, tol)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    // The crossing on this end's side: the one nearer its
+                    // corner along the contact.
+                    let c = &b.contacts[r.side];
+                    let tc = param_on(c, c.domain(), cl.point, tol)?;
+                    let period = period_of(c, tol);
+                    let gap = |t: f64| {
+                        let d = t - tc;
+                        period.map_or(d.abs(), |p| {
+                            let d = d.rem_euclid(p);
+                            d.min(p - d)
+                        })
+                    };
+                    let (p, q) = if gap(r.enter.at) <= gap(r.leave.at) {
+                        (r.enter.point, q0)
+                    } else {
+                        (r.leave.point, q1)
+                    };
+                    let (a, z) = (cl.point, co.point);
+                    let key_l = piece_key(left, b.edge, a, p, &mut points);
+                    let key_o = piece_key(other, b.edge, z, q, &mut points);
+                    let (Some(&kl), Some(&ko)) = (made.get(&key_l), made.get(&key_o)) else {
+                        return Ok(None);
+                    };
+                    let switch = section(&mut points, &mut edges, &mut made, b, None, p, q)?;
+                    let cut = cut_at(b, v, a, z);
+                    let capped =
+                        section(&mut points, &mut edges, &mut made, b, cut.as_ref(), z, a)?;
+                    let Some(wl) = walked(left, kl) else {
+                        return Ok(None);
+                    };
+                    let Some(ring) = chained_ring(&edges, (kl, !wl), &[ko, switch.0, capped.0])
+                    else {
+                        return Ok(None);
+                    };
+                    rings.push(ring);
+                }
             }
-            // The run's piece: the other face's contact along it, walked
+            // Each run's piece: the other face's contact along it, walked
             // against that face's way, the switches and the edges between
             // the crossings.
-            let key_o = piece_key(other, b.edge, q0, q1, &mut points);
-            let Some(&ko) = made.get(&key_o) else {
-                return Ok(None);
-            };
-            let mut stops = vec![r.enter.point];
-            for w in r.run.over.windows(2) {
-                let (a, z) = (&curved.edges[&w[0]], &curved.edges[&w[1]]);
-                let v = if a.ends.0 == z.ends.0 || a.ends.0 == z.ends.1 {
-                    a.ends.0
-                } else {
-                    a.ends.1
-                };
-                stops.push(curved.points[&v]);
-            }
-            stops.push(r.leave.point);
-            let mut others: Vec<usize> = Vec::with_capacity(stops.len() + 1);
-            for (k, w) in stops.windows(2).enumerate() {
-                let key = piece_key(usize::MAX, r.run.over[k], w[0], w[1], &mut points);
-                let Some(&kk) = made.get(&key) else {
+            let mut run_rings: Vec<(usize, Vec<(usize, bool)>)> = Vec::with_capacity(runs.len());
+            for (j, run) in &runs {
+                let (Some(&q0), Some(&q1)) = (run.run.feet.first(), run.run.feet.last()) else {
                     return Ok(None);
                 };
-                others.push(kk);
+                let Some(ko) = contact_pieces(other, q0, q1, &mut points, &made)? else {
+                    return Ok(None);
+                };
+                let mut stops = vec![run.enter.point];
+                for w in run.run.over.windows(2) {
+                    let (a, z) = (&curved.edges[&w[0]], &curved.edges[&w[1]]);
+                    let v = if a.ends.0 == z.ends.0 || a.ends.0 == z.ends.1 {
+                        a.ends.0
+                    } else {
+                        a.ends.1
+                    };
+                    stops.push(curved.points[&v]);
+                }
+                stops.push(run.leave.point);
+                let mut others: Vec<usize> = ko[1..].to_vec();
+                for (k, w) in stops.windows(2).enumerate() {
+                    let key = piece_key(usize::MAX, run.run.over[k], w[0], w[1], &mut points);
+                    let Some(&kk) = made.get(&key) else {
+                        return Ok(None);
+                    };
+                    others.push(kk);
+                }
+                for (p, q) in [(run.enter.point, q0), (run.leave.point, q1)] {
+                    others.push(section(&mut points, &mut edges, &mut made, b, None, p, q)?.0);
+                }
+                let Some(wo) = walked(other, ko[0]) else {
+                    return Ok(None);
+                };
+                let Some(run_ring) = chained_ring(&edges, (ko[0], !wo), &others) else {
+                    return Ok(None);
+                };
+                run_rings.push((*j, run_ring));
             }
-            for (p, q) in [(r.enter.point, q0), (r.leave.point, q1)] {
-                others.push(section(&mut points, &mut edges, &mut made, b, None, p, q)?.0);
-            }
-            let Some(wo) = walked(other, ko) else {
-                return Ok(None);
-            };
-            let Some(run_ring) = chained_ring(&edges, (ko, !wo), &others) else {
-                return Ok(None);
-            };
             // Each faces out, away from both faces there; a ring runs the
             // surface's way.
             let oriented = |surface: &SurfaceGeometry,
@@ -4386,23 +4472,29 @@ fn assemble_widened(
                     reversed,
                 })
             };
-            let mut made_rings = Vec::with_capacity(3);
+            let mut made_rings: Vec<(Option<usize>, SheetRings)> =
+                Vec::with_capacity(rings.len() + run_rings.len());
             for ring in rings {
                 let at = points.points[edges[ring[0].0].ends.0];
-                made_rings.push(oriented(&b.surface, ring, at)?);
+                made_rings.push((None, oriented(&b.surface, ring, at)?));
             }
-            let middle = r.run.centres.len() / 2;
-            let run_at = r.run.feet[middle].midpoint(r.run.on_edge[middle]);
-            let run_at =
-                ogeom_geom::project::project_on_surface(&r.run.surface, run_at, 16, tol)?.point;
-            made_rings.push(oriented(&r.run.surface, run_ring, run_at)?);
+            for (j, run_ring) in run_rings {
+                let run = &rolled[j].run;
+                let middle = run.centres.len() / 2;
+                let run_at = run.feet[middle].midpoint(run.on_edge[middle]);
+                let run_at =
+                    ogeom_geom::project::project_on_surface(&run.surface, run_at, 16, tol)?.point;
+                made_rings.push((Some(j), oriented(&run.surface, run_ring, run_at)?));
+            }
             let mut made_rings = made_rings.into_iter();
-            let Some(first) = made_rings.next() else {
+            let Some((_, first)) = made_rings.next() else {
                 return Ok(None);
             };
             rings_of.push(first);
-            let strip = rolled.iter().position(|q| q.strip == r.strip).unwrap_or(0);
-            rolled_faces.extend(made_rings.map(|m| (rolled[strip].strip, m)));
+            for (j, m) in made_rings {
+                rolled_faces.push((r.strip, m));
+                rolled_runs.push(j);
+            }
             continue;
         }
         // A contact's piece: the face's own, or, on a consumed face, made
@@ -5381,7 +5473,10 @@ fn assemble_widened(
             let within = if !matches!(rings.surface, SurfaceGeometry::BSpline(_)) {
                 region.clone()
             } else {
-                let Some(r) = rolled.iter().find(|r| r.strip == *strip) else {
+                let Some(r) = rolled_runs[n]
+                    .map(|j| &rolled[j])
+                    .or_else(|| rolled.iter().find(|r| r.strip == *strip))
+                else {
                     return Ok(None);
                 };
                 let Some(edge_region) = resting_region(curved, r, tol)? else {

@@ -85,11 +85,14 @@ pub(crate) fn round(
     let mut boxes: Vec<(usize, ogeom_algo::HalfSpaces)> = Vec::new();
     // Whether a round reaches a face it does not end at (ADR 0001, §4.5).
     let mut non_local = false;
+    // Each strip's edges standing under its round, read once its runs are:
+    // an edge its ball rests on is a seat, not a face it reaches.
+    let mut unders: Vec<Vec<Id>> = Vec::with_capacity(asked.len());
     for (edge, _, radius) in &asked {
         let Some((strip, clear, under)) = strip_of(model, &curved, *edge, *radius, tol)? else {
             return Ok(None);
         };
-        non_local |= !under.is_empty();
+        unders.push(under);
         if let Some(clear) = clear {
             boxes.push((strips.len(), clear));
         }
@@ -108,7 +111,13 @@ pub(crate) fn round(
     // A contact leaving its face rolls over onto what bounds it there: the
     // ball rests on the edge it crosses until it comes back (ADR 0001,
     // section 13, question 8), each run read from the crossing pairs.
-    let crossings = roll_overs(&curved, &contacts, &corners, tol)?;
+    let crossings = leaving_first(
+        model,
+        &curved,
+        &contacts,
+        roll_overs(&curved, &contacts, &corners, tol)?,
+        tol,
+    )?;
     let mut rolled: Vec<RolledRun> = Vec::new();
     if rolls_over(&crossings) {
         let mut k = 0;
@@ -133,6 +142,20 @@ pub(crate) fn round(
                 .iter()
                 .find(|(e, _, _)| *e == s.edge)
                 .map_or(0.0, |(_, _, r)| *r);
+            // The contact off its face between the crossings, the way
+            // round over its start where it leaves before the end of its
+            // domain and comes back after.
+            let contact = &s.contacts[side];
+            let through = {
+                let (lo, hi) = contact.domain();
+                let closed = contact.is_periodic() || contact.is_closed(tol);
+                let back = if leave.at < enter.at && closed {
+                    leave.at + (hi - lo)
+                } else {
+                    leave.at
+                };
+                contact.point_at(0.5 * (enter.at + back), tol)?
+            };
             let run = match super::seats::edge_run(
                 model,
                 &curved,
@@ -142,6 +165,7 @@ pub(crate) fn round(
                 s.faces[1 - side],
                 enter,
                 leave,
+                through,
                 tol,
             )? {
                 Ok(run) => run,
@@ -169,6 +193,13 @@ pub(crate) fn round(
             });
             k += 2;
         }
+    }
+    for (k, under) in unders.iter().enumerate() {
+        non_local |= under.iter().any(|u| {
+            !rolled
+                .iter()
+                .any(|r| r.strip == k && r.run.over.contains(u))
+        });
     }
     // A rim's round reaching a face it does not blend (a cavity's wall
     // under a thin cap) is not built here: every face but the strip's two
@@ -312,6 +343,7 @@ pub(crate) fn round(
         };
         strip.section = Section::Arc { spine };
     }
+    let corners = seated_corners(&curved, &strips, &rolled, corners, tol)?;
     let blended: FastSet<Id> = strips.iter().map(|s| s.edge).collect();
     // P4 and P5; what the assembly or the solid's check refuses is handed
     // back.
@@ -360,6 +392,126 @@ fn strip_of(
             .map(|(s, c, u)| (s, Some(c), u))),
         _ => Ok(None),
     }
+}
+
+/// `corners` with each closed rim's corner at its one vertex, on the face
+/// a run's contact takes there, moved onto that run's contact: where the
+/// run's contact crosses the plane through the vertex square to the rim,
+/// the station the face's edge at the vertex (a wall's seam) now ends at.
+/// The rim's contact there is under the run, which takes the round's
+/// boundary on the face across the vertex.
+///
+/// # Errors
+///
+/// As evaluating the curves.
+fn seated_corners(
+    curved: &Curved,
+    strips: &[Strip],
+    rolled: &[RolledRun],
+    mut corners: FastMap<(usize, Id), super::setbacks::Corner>,
+    tol: Tolerances,
+) -> OgeomResult<FastMap<(usize, Id), super::setbacks::Corner>> {
+    use super::trimmed::param_on;
+    for r in rolled {
+        let s = &strips[r.strip];
+        let e = &curved.edges[&s.edge];
+        if e.ends.0 != e.ends.1 {
+            continue;
+        }
+        let (Some(&q0), Some(&q1)) = (r.run.feet.first(), r.run.feet.last()) else {
+            continue;
+        };
+        let middle = r.run.feet[r.run.feet.len() / 2];
+        let c = &s.contacts[1 - r.side];
+        let (lo, hi) = c.domain();
+        let period = hi - lo;
+        let wrap = |t: f64, from: f64| from + (t - from).rem_euclid(period);
+        let (t0, t1, tm) = (
+            param_on(c, c.domain(), q0, tol)?,
+            param_on(c, c.domain(), q1, tol)?,
+            param_on(c, c.domain(), middle, tol)?,
+        );
+        // The way from one end of the run to the other holding its middle.
+        let (from, to) = if wrap(tm, t0) <= wrap(t1, t0) {
+            (t0, wrap(t1, t0))
+        } else {
+            (t1, wrap(t0, t1))
+        };
+        let v = e.ends.0;
+        let at = curved.points[&v];
+        let square = e.curve.d1_at(e.range.0, tol)?;
+        let square = square / square.magnitude();
+        let other = s.faces[1 - r.side];
+        for key in [(other, v), (other, super::setbacks::pinched(v))] {
+            let Some(corner) = corners.get_mut(&key) else {
+                continue;
+            };
+            let Some(t) = corner.on(s.edge) else {
+                continue;
+            };
+            let t = wrap(t, from);
+            if t <= from + tol.parametric() || t >= to - tol.parametric() {
+                continue;
+            }
+            let Some((_, point)) = super::setbacks::station(&r.run.contact, at, square, tol)?
+            else {
+                continue;
+            };
+            corner.point = point;
+            for (x, t) in &mut corner.on {
+                if *x != s.edge {
+                    let edge = &curved.edges[x];
+                    *t = param_on(&edge.curve, edge.range, point, tol)?;
+                }
+            }
+        }
+    }
+    Ok(corners)
+}
+
+/// `crossings` (as [`roll_overs`] sorts them) with each closed contact's
+/// own put to start where it leaves its face, so that they pair as the
+/// engine reads them: each where the contact leaves, then where it comes
+/// back. A contact closed on a rim of one vertex starts at that vertex,
+/// which may stand where the contact is already off its face: its first
+/// crossing is then where it comes back, and the run off the face over
+/// the start is the last crossing's to the first's.
+///
+/// # Errors
+///
+/// As evaluating the contacts and measuring to the faces.
+fn leaving_first(
+    model: &Model,
+    curved: &Curved,
+    contacts: &FastMap<(usize, Id), Curve>,
+    crossings: Vec<super::setbacks::RollOver>,
+    tol: Tolerances,
+) -> OgeomResult<Vec<super::setbacks::RollOver>> {
+    let mut out = Vec::with_capacity(crossings.len());
+    let mut rest = crossings.as_slice();
+    while let Some(first) = rest.first() {
+        let n = rest
+            .iter()
+            .take_while(|x| (x.face, x.edge) == (first.face, first.edge))
+            .count();
+        let (group, tail) = rest.split_at(n);
+        rest = tail;
+        let contact = &contacts[&(first.face, first.edge)];
+        let closed = contact.is_periodic() || contact.is_closed(tol);
+        let mut group = group.to_vec();
+        if closed && n >= 2 {
+            // The contact between the first two crossings: off its face
+            // where the first is where it leaves.
+            let middle = contact.point_at(0.5 * (group[0].at + group[1].at), tol)?;
+            let face =
+                ogeom_algo::PointDistance::of(model, &curved.faces[first.face].shape, tol)?;
+            if face.nearest(middle, tol)?.0 <= tol.confusion() {
+                group.rotate_right(1);
+            }
+        }
+        out.extend(group);
+    }
+    Ok(out)
 }
 
 /// Which way along `up` the cylinder face `fi` leaves the rim `edge` at the

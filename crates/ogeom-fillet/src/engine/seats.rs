@@ -100,8 +100,9 @@ const ACROSS: usize = 17;
 
 /// The run of the round whose face-to-face centre path is `spine` (its
 /// station planes square to it), radius `radius`, its contact on face
-/// `left` leaving over `enter.over` at `enter` and coming back at `leave`,
-/// its other face `other`: the ball resting on the edge between.
+/// `left` leaving over `enter.over` at `enter` and coming back at `leave`
+/// through `through` (the contact off its face between them), its other
+/// face `other`: the ball resting on the edge between.
 ///
 /// `Ok(Err(..))` names a seat change not built here.
 ///
@@ -118,6 +119,7 @@ pub(crate) fn edge_run(
     other: usize,
     enter: &RollOver,
     leave: &RollOver,
+    through: Point,
     tol: Tolerances,
 ) -> OgeomResult<Result<EdgeRun, NotSeated>> {
     let Some(chain) = seat_chain(curved, left, enter.over, leave.over, tol)? else {
@@ -165,6 +167,7 @@ pub(crate) fn edge_run(
         super::trimmed::param_on(spine, spine.domain(), enter.point, tol)?,
         super::trimmed::param_on(spine, spine.domain(), leave.point, tol)?,
     );
+    let s1 = the_way_through(spine, s0, s1, through, tol)?;
     let mut n = FIRST_STATIONS;
     loop {
         let mut centres = Vec::with_capacity(n);
@@ -249,6 +252,34 @@ pub(crate) fn edge_run(
         }
         n = 2 * n - 1;
     }
+}
+
+/// Where a run from `s0` to `s1` on `spine` ends, the way round passing
+/// beside `through` on a closed spine: `s1` itself, or moved a period so
+/// the run crosses the spine's own start (a rim's contact off its face
+/// over the rim's one vertex). The way whose middle stands nearer
+/// `through` is the run's.
+///
+/// # Errors
+///
+/// As evaluating the spine.
+fn the_way_through(
+    spine: &Curve,
+    s0: f64,
+    s1: f64,
+    through: Point,
+    tol: Tolerances,
+) -> OgeomResult<f64> {
+    if !(spine.is_periodic() || spine.is_closed(tol)) {
+        return Ok(s1);
+    }
+    let (lo, hi) = spine.domain();
+    let period = hi - lo;
+    let other = if s1 >= s0 { s1 - period } else { s1 + period };
+    let off = |end: f64| -> OgeomResult<f64> {
+        Ok(spine.point_at(0.5 * (s0 + end), tol)?.distance(through))
+    };
+    Ok(if off(other)? < off(s1)? { other } else { s1 })
 }
 
 /// The edges of face `face`'s loop from `first` to `last`, each running on
@@ -488,7 +519,16 @@ mod tests {
         assert_eq!(rolls.len(), 2);
         let spine = line(Point::new(9.6, -10.0, 18.0), Point::new(9.6, 10.0, 18.0));
         let run = edge_run(
-            &model, &curved, &spine, 3.0, top, front, &rolls[0], &rolls[1], T,
+            &model,
+            &curved,
+            &spine,
+            3.0,
+            top,
+            front,
+            &rolls[0],
+            &rolls[1],
+            Point::new(9.6, 0.0, 21.0),
+            T,
         )
         .unwrap()
         .unwrap();

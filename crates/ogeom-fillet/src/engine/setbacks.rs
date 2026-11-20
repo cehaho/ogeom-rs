@@ -691,7 +691,7 @@ fn start_param(edge: &super::curved::CurvedEdge, forward: bool) -> f64 {
 /// crossing nearest `at`, its parameter and point. `None` where it does not
 /// cross within its domain.
 #[cfg_attr(not(test), allow(dead_code, reason = "used by curved_corners"))]
-fn station(
+pub(crate) fn station(
     curve: &ogeom_geom::Curve,
     at: Point,
     t: Vector,
