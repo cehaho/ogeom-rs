@@ -149,3 +149,112 @@ fn concave_rounds_between_fused_cylinders_are_exact_cylinders() {
         assert!((volumes[0] - volumes[1]).abs() < 1e-9, "either order");
     }
 }
+
+/// A concave seam between two fused walls standing on a plate whose top
+/// leans off square to the seam (2 in 100, and 1 across), a slot run under the top past
+/// the ball's contacts: the round is local (the slot's ceiling stands
+/// behind the plate's top, which the round ends on, though above the plane
+/// square to the seam through its foot), its foot cut by the leaning top
+/// exactly, and built by the engine with no boolean, its fill the
+/// section's times the seam's length within 1e-3. Refused before the
+/// leaning end was read: the ceiling stood in the square-ended box, and
+/// the strip's end was taken flush only on a plane square to it.
+#[test]
+fn a_concave_round_ends_on_a_leaning_floor_beside_a_hole() {
+    let (wall, pitch, height, radius, lean) = (3.58_f64, 5.5_f64, 10.0, 1.0, 0.02);
+    let mut model = Model::new();
+    let mut lobes = Vec::new();
+    for i in 0..2 {
+        let frame = Frame::new(
+            Point::new(f64::from(i) * pitch, 0.0, -1.0),
+            Direction::Z,
+            Direction::X,
+            T,
+        )
+        .unwrap();
+        lobes.push(
+            ogeom_algo::make_cylinder(&mut model, frame, wall, height, T)
+                .unwrap()
+                .shape,
+        );
+    }
+    let two = ogeom_bool::fuse(&mut model, &lobes[0], &lobes[1], T)
+        .unwrap()
+        .shape;
+    // The plate's top `z = -lean (y + (x - pitch / 2) / 2)`, through the
+    // seam's line at `y = 0`: leaning across the seam too, so that the
+    // round's two corners on it stand at two heights.
+    let up = Direction::new(ogeom_math::Vector::new(0.5 * lean, lean, 1.0), T).unwrap();
+    let frame = Frame::new(Point::ORIGIN, up, Direction::X, T).unwrap();
+    let (x, y, z) = (frame.x().vector(), frame.y().vector(), up.vector());
+    let corner = Point::new(0.5 * pitch, 0.0, 0.0) - z * 3.0 - x * 10.0 - y * 10.0;
+    let plate = ogeom_algo::make_box(
+        &mut model,
+        Frame::new(corner, up, Direction::X, T).unwrap(),
+        (20.0, 20.0, 3.0),
+        T,
+    )
+    .unwrap()
+    .shape;
+    let stood = ogeom_bool::fuse(&mut model, &two, &plate, T).unwrap().shape;
+    let seam_y = -(wall * wall - pitch * pitch / 4.0).sqrt();
+    // A slot run in from the plate's side under its top, a skin of 0.01
+    // over it, from past the ball's contacts on out: its ceiling within the
+    // box the round can take up, behind the top.
+    let skin = 0.01;
+    let mouth = Point::new(0.5 * pitch, 0.0, 0.0) - x * 1.0 - y * 11.0 - z * (skin + 0.5);
+    let slot = ogeom_algo::make_box(
+        &mut model,
+        Frame::new(mouth, up, Direction::X, T).unwrap(),
+        (2.0, 11.0 + seam_y - 0.8 * radius, 0.5),
+        T,
+    )
+    .unwrap()
+    .shape;
+    let solid = ogeom_bool::cut(&mut model, &stood, &slot, T).unwrap().shape;
+    let point = |model: &Model, v: &Shape| {
+        v.transform(model.datums())
+            .unwrap()
+            .apply(model.node(v).unwrap().data().as_vertex().unwrap().point)
+    };
+    let seam = explore_unique(&model, &solid, ShapeType::Edge)
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            ogeom_algo::edge_vertices(&model, e)
+                .unwrap()
+                .is_some_and(|(a, b)| {
+                    let (a, b) = (point(&model, &a), point(&model, &b));
+                    [a, b].iter().all(|p| {
+                        (p.x - 0.5 * pitch).abs() < 1e-7 && (p.y - seam_y).abs() < 1e-7
+                    }) && (a.z - b.z).abs() > 0.5 * height
+                })
+        })
+        .expect("the concave seam");
+    let volume = |model: &Model, s: &Shape| {
+        ogeom_algo::volume_properties(model, s, ogeom_mesh::Deflection::default(), T)
+            .unwrap()
+            .mass
+    };
+    let before = volume(&model, &solid);
+    let (built, work) = ogeom_bool::work::counted(|| {
+        ogeom_fillet::fillet_edges(&mut model, &solid, &[seam], radius, T).unwrap()
+    });
+    assert_eq!(work.face_pairs, 0, "built with no boolean");
+    let check = ogeom_algo::check(&model, &built.shape, T).unwrap();
+    assert!(check.is_valid(), "{:?}", check.problems);
+    // One fill: half the two the section holds past its bare discs.
+    let half = 0.5 * pitch;
+    let lens =
+        2.0 * wall * wall * (half / wall).acos() - pitch * (wall * wall - half * half).sqrt();
+    let bare = 3.0 * core::f64::consts::PI * wall * wall - 2.0 * lens;
+    let fill = 0.5 * (section_area(wall, pitch, radius) - bare);
+    // From the leaning floor under the fill's middle to the lobes' tops.
+    let length = height - 1.0 + lean * (seam_y - 0.5 * radius);
+    let grown = volume(&model, &built.shape) - before;
+    assert!(
+        (grown - fill * length).abs() < 1e-3 * fill * length,
+        "{grown} against {}",
+        fill * length
+    );
+}

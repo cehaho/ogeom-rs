@@ -6578,6 +6578,17 @@ fn flush(
             Section::Arc {
                 spine: Curve::BSpline(_),
             } => true,
+            // A straight strip whose corners stand at two stations (a face
+            // leaning off square to the edge) is cut by the plane through
+            // both, exactly ([`skew_control`], as `section` builds it): its
+            // end lies on the face's plane once the plane holds both.
+            Section::Arc {
+                spine: spine @ Curve::Line(_),
+            } => {
+                let centre = spine.point_at(param_on(spine, spine.domain(), p, tol)?, tol)?;
+                let far = spine.point_at(param_on(spine, spine.domain(), q, tol)?, tol)?;
+                centre.distance(far) > tol.confusion() || on(centre)
+            }
             Section::Arc { spine } => {
                 on(spine.point_at(param_on(spine, spine.domain(), p, tol)?, tol)?)
             }

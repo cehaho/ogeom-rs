@@ -353,7 +353,8 @@ fn strip_of(
     }
     match &e.curve {
         Curve::Line(_) => {
-            Ok(straight(curved, edge, e, [f0, f1], radius, tol)?.map(|(s, c)| (s, c, Vec::new())))
+            Ok(straight(model, curved, edge, e, [f0, f1], radius, tol)?
+                .map(|(s, c)| (s, c, Vec::new())))
         }
         Curve::Circle(circle) => Ok(rim(model, curved, edge, circle, [f0, f1], radius, tol)?
             .map(|(s, c, u)| (s, Some(c), u))),
@@ -406,6 +407,7 @@ fn wall_way(
 /// along the plane, and along the cylinder, whose nearest point is the
 /// foot).
 fn straight(
+    model: &Model,
     curved: &Curved,
     edge: Id,
     e: &CurvedEdge,
@@ -616,6 +618,13 @@ fn straight(
                 inside: false,
             },
         ];
+        // An end on one plane leaning off square to the edge: the round
+        // ends on it, so what stands behind it there is clear too.
+        for (v, square) in [(e.ends.0, u), (e.ends.1, -u)] {
+            if let Some(plane) = end_plane(model, curved, faces, v, u, &feet, square, tol)? {
+                outside.push(plane);
+            }
+        }
         if convex {
             let w = mid - centre;
             let w = w / w.magnitude();
@@ -644,6 +653,70 @@ fn straight(
         },
         clear,
     )))
+}
+
+/// The half-space behind the plane a straight strip ends on at its vertex
+/// `v`, as [`HalfSpaces::Below`](ogeom_algo::HalfSpaces::Below): where the
+/// one face meeting the strip's two there is a plane leaning off square to
+/// the edge (`square` the edge's direction into the strip from `v`), and the
+/// strip's contacts, lines along `u` through `feet`, cross it on that
+/// face, so the cap the assembly cuts there stands on it. `None` otherwise,
+/// the end then read square as before.
+///
+/// # Errors
+///
+/// As classifying a point on the face.
+#[allow(clippy::too_many_arguments, reason = "one end of one strip, all its data")]
+fn end_plane(
+    model: &Model,
+    curved: &Curved,
+    faces: [usize; 2],
+    v: Id,
+    u: Vector,
+    feet: &[Point; 2],
+    square: Vector,
+    tol: Tolerances,
+) -> OgeomResult<Option<ogeom_algo::HalfSpaces>> {
+    let at_v: Vec<usize> = (0..curved.faces.len())
+        .filter(|fi| !faces.contains(fi))
+        .filter(|fi| {
+            curved.faces[*fi].loops.iter().flatten().any(|(x, _)| {
+                let c = &curved.edges[x];
+                c.ends.0 == v || c.ends.1 == v
+            })
+        })
+        .collect();
+    let [fi] = at_v[..] else {
+        return Ok(None);
+    };
+    let SurfaceGeometry::Plane(plane) = &curved.faces[fi].surface else {
+        return Ok(None);
+    };
+    let plane = plane.plane();
+    let n = plane.normal().vector();
+    let n = if n.dot(square) < 0.0 { -n } else { n };
+    let lean = n.dot(square);
+    // Square to the edge: the end plane already says it. Along it: no cap.
+    if lean >= 1.0 - tol.angular() || lean <= LEAVING {
+        return Ok(None);
+    }
+    let corner = curved.points[&v];
+    let o = corner - n * plane.signed_distance_to(corner);
+    let fine = ogeom_mesh::Deflection {
+        chord: tol.confusion() * 10.0,
+        ..Default::default()
+    };
+    for foot in feet {
+        let along = (o - *foot).dot(n) / u.dot(n);
+        let crossing = *foot + u * along;
+        if matches!(
+            ogeom_algo::classify_on_face(model, &curved.faces[fi].shape, crossing, fine, tol)?,
+            ogeom_algo::Containment::Out
+        ) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(ogeom_algo::HalfSpaces::Below { normal: n, at: o }))
 }
 
 /// How far off a straight edge's line another edge must leave it, as a
