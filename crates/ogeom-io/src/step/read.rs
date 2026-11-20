@@ -6113,6 +6113,13 @@ fn closed_ring_edges(model: &Model, wires: &[Shape]) -> OgeomResult<Vec<(Shape, 
 /// short of its ends: both within a hair of the curve, in the curve's own
 /// order, and not the whole curve. `None` where the vertices are off the
 /// curve, reversed against it, or already at its ends.
+///
+/// On a curve that closes on itself (a fitted loop, its ends one point) a
+/// vertex at that point has two feet, the curve's start and its end, and
+/// the projection returns either. The edge's start takes the curve's
+/// start there and its end the curve's end: a loop's first quarter, from
+/// the closing point on, is the window from the start, not one run back
+/// from the end, which would be refused and leave the edge the whole loop.
 fn window_between_feet(
     curve: &Curve,
     start: Point,
@@ -6128,8 +6135,21 @@ fn window_between_feet(
         let found = project_on_curve(curve, p, samples, tol).ok()?;
         (found.distance <= tol.confusion() * 1e4).then_some(found.parameter)
     };
-    let (a, b) = (foot(start)?, foot(end)?);
+    let (mut a, mut b) = (foot(start)?, foot(end)?);
     let slack = tol.parametric().max((hi - lo) * 1e-9);
+    // A vertex standing where a closed curve closes, as near as the edge's
+    // ends are held to the curve's ends by the caller.
+    if let (Ok(head), Ok(tail)) = (curve.point_at(lo, tol), curve.point_at(hi, tol))
+        && head.distance(tail) <= tol.confusion()
+    {
+        let near = tol.confusion() * 10.0;
+        if head.distance(start) <= near {
+            a = lo;
+        }
+        if tail.distance(end) <= near {
+            b = hi;
+        }
+    }
     if b <= a + slack {
         return None;
     }
@@ -6612,6 +6632,42 @@ mod tests {
         assert!(window_between_feet(&spline, at(0.7), at(0.3), T).is_none());
         let off = at(0.3) + Vector::new(0.0, 0.0, 0.5);
         assert!(window_between_feet(&spline, off, at(0.7), T).is_none());
+    }
+
+    /// On a fitted loop, its ends one point, an edge from that point to a
+    /// vertex a quarter along takes the quarter from the start, and one
+    /// from a vertex three quarters along back to that point the quarter
+    /// to the end, whichever foot the projection finds there. Read as the
+    /// window run back from the end, the first was refused and the edge
+    /// held to the whole loop: a face bounded by it wound its chart twice
+    /// over (a ring's drilled hole).
+    #[test]
+    fn an_edge_from_a_loops_closing_point_takes_the_window_from_its_start() {
+        let spline: Curve = BSplineCurve::new(
+            KnotVector::clamped_uniform(3, 8).unwrap(),
+            vec![
+                Point::new(1.0, 0.0, 0.0),
+                Point::new(1.0, 0.8, 0.1),
+                Point::new(0.2, 1.2, 0.0),
+                Point::new(-0.9, 0.7, -0.1),
+                Point::new(-1.0, -0.6, 0.0),
+                Point::new(-0.1, -1.1, 0.1),
+                Point::new(1.0, -0.8, 0.0),
+                Point::new(1.0, 0.0, 0.0),
+            ],
+            T,
+        )
+        .unwrap()
+        .into();
+        let at = |t: f64| spline.point_at(t, T).unwrap();
+        let (a, b) = window_between_feet(&spline, at(0.0), at(0.25), T).unwrap();
+        assert!(a.abs() < 1e-9 && (b - 0.25).abs() < 1e-7, "{a} .. {b}");
+        let (a, b) = window_between_feet(&spline, at(1.0), at(0.25), T).unwrap();
+        assert!(a.abs() < 1e-9 && (b - 0.25).abs() < 1e-7, "{a} .. {b}");
+        let (a, b) = window_between_feet(&spline, at(0.75), at(0.0), T).unwrap();
+        assert!((a - 0.75).abs() < 1e-7 && (b - 1.0).abs() < 1e-9, "{a} .. {b}");
+        // The whole loop is still no window.
+        assert!(window_between_feet(&spline, at(0.0), at(1.0), T).is_none());
     }
 
     /// A parallel of a cone read as a circle a few tenths of a micron wider
