@@ -12,7 +12,7 @@
 use ogeom_core::{OgeomResult, Tolerances, ogeom_bail};
 use ogeom_geom::Curve3d as _;
 use ogeom_math::{Point, Vector};
-use ogeom_topo::{Model, Shape, ShapeType, explore_unique};
+use ogeom_topo::{Model, SameKey, Shape, ShapeType, explore_unique};
 
 use super::Origin;
 use super::assemble::Ring;
@@ -173,15 +173,99 @@ fn may_coincide(model: &Model, a: &Shape, b: &Shape) -> bool {
     }
 }
 
+/// What [`input_problems`] read of the solid a request came in with.
+struct Inherited {
+    /// What the kernel's check found on it, by sub-shape and in its words.
+    problems: Vec<(SameKey, String)>,
+    /// Its edges, each with the faces either side.
+    edges: ogeom_core::FastMap<SameKey, Vec<Shape>>,
+}
+
+std::thread_local! {
+    /// What the solid the request came in with already was, while
+    /// [`input_problems`] holds it: `None` outside it.
+    static INHERITED: core::cell::RefCell<Option<Inherited>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Holds what [`input_problems`] read until dropped.
+pub(crate) struct InputProblems;
+
+impl Drop for InputProblems {
+    fn drop(&mut self) {
+        INHERITED.with(|held| *held.borrow_mut() = None);
+    }
+}
+
+/// Until the value returned is dropped, every [`solid_fits`] holds a
+/// result to what the blend did, not to what `solid` already was: a
+/// problem the check finds on a sub-shape of `solid` left as it came, said
+/// the same way, is the input's (an imported body with a face broken far
+/// from the edges asked), and no construction of the rounds could mend
+/// it; nor is a fold between two of its faces along an edge they still
+/// share as they did. Anything the blend built or changed is still held
+/// to the whole check. `None` where an outer call holds a reading already: the routes'
+/// own calls, on the pieces they make, keep the outermost.
+///
+/// # Errors
+///
+/// As checking `solid`.
+pub(crate) fn input_problems(
+    model: &Model,
+    solid: &Shape,
+    tol: Tolerances,
+) -> OgeomResult<Option<InputProblems>> {
+    if INHERITED.with(|held| held.borrow().is_some()) {
+        return Ok(None);
+    }
+    let found = ogeom_algo::check(model, solid, tol)?;
+    let problems = found
+        .problems
+        .into_iter()
+        .map(|p| (SameKey(p.at), p.what))
+        .collect();
+    let mut edges = ogeom_core::FastMap::default();
+    for e in explore_unique(model, solid, ShapeType::Edge)? {
+        let faces = ogeom_topo::ancestors_of(model, solid, &e, ShapeType::Face)?;
+        edges.insert(SameKey(e), faces);
+    }
+    INHERITED.with(|held| *held.borrow_mut() = Some(Inherited { problems, edges }));
+    Ok(Some(InputProblems))
+}
+
 /// The built solid's own guards: the kernel's check, and no two faces folded
-/// flat along an edge.
+/// flat along an edge. Within [`input_problems`], a problem the input
+/// already had on a sub-shape left as it came is not the blend's, nor are
+/// two faces meeting along an edge of the input as they met there.
 ///
 /// # Errors
 ///
 /// [`OgeomError::Construction`](ogeom_core::OgeomError::Construction) where
 /// either fails.
 pub(crate) fn solid_fits(model: &Model, solid: &Shape, tol: Tolerances) -> OgeomResult<()> {
-    let found = ogeom_algo::check(model, solid, tol)?;
+    let mut found = ogeom_algo::check(model, solid, tol)?;
+    INHERITED.with(|held| {
+        if let Some(inherited) = held.borrow().as_ref() {
+            found.problems.retain(|p| {
+                !inherited
+                    .problems
+                    .iter()
+                    .any(|(at, what)| at.0.is_same(&p.at) && *what == p.what)
+            });
+        }
+    });
+    // An edge of the input still between the two faces it had there: what
+    // meets along it is as it came.
+    let as_it_came = |e: &Shape, a: &Shape, b: &Shape| {
+        INHERITED.with(|held| {
+            held.borrow().as_ref().is_some_and(|inherited| {
+                inherited.edges.get(&SameKey(e.clone())).is_some_and(|faces| {
+                    let had = |f: &Shape| faces.iter().any(|g| g.is_same(f));
+                    faces.len() == 2 && had(a) && had(b)
+                })
+            })
+        })
+    };
     if !found.is_valid() {
         ogeom_bail!(
             Construction,
@@ -192,6 +276,9 @@ pub(crate) fn solid_fits(model: &Model, solid: &Shape, tol: Tolerances) -> Ogeom
     for e in explore_unique(model, solid, ShapeType::Edge)? {
         let faces = ogeom_topo::ancestors_of(model, solid, &e, ShapeType::Face)?;
         if let [a, b] = faces.as_slice() {
+            if as_it_came(&e, a, b) {
+                continue;
+            }
             // Read at the edge: a face's normal at its own middle says
             // nothing of how it meets a neighbour (a half drum's wall faces
             // away from the flat it meets square).

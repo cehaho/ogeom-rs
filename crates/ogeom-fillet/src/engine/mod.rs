@@ -48,6 +48,7 @@ mod fits;
 mod flush;
 mod guards;
 mod hold_edge;
+pub(crate) use guards::input_problems;
 pub(crate) mod junction;
 mod law_tools;
 mod marched_junctions;

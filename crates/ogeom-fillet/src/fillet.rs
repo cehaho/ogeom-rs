@@ -1026,6 +1026,8 @@ pub(crate) fn rounds_by_engine(
     edges: &[(Shape, f64)],
     tol: Tolerances,
 ) -> OgeomResult<Option<Built>> {
+    // An input already failing its check is held to what the rounds did.
+    let _held = crate::engine::input_problems(model, solid, tol)?;
     match rounds_by_engine_pieces(model, solid, edges, tol)? {
         Some(built) => crate::engine::merged(model, solid, built, tol).map(Some),
         None => Ok(None),
