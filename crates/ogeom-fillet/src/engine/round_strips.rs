@@ -321,7 +321,7 @@ pub(crate) fn round(
         Err(e @ ogeom_core::OgeomError::Cancelled) => return Err(e),
         Err(_) => return Ok(None),
     };
-    match super::guards::solid_fits(model, &built.shape, tol) {
+    match super::guards::solid_fits_given(model, &built.shape, solid, tol) {
         Ok(()) => Ok(Some(built)),
         Err(e @ ogeom_core::OgeomError::Cancelled) => Err(e),
         Err(_) => Ok(None),

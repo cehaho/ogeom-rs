@@ -243,6 +243,32 @@ pub(crate) fn input_problems(
 /// [`OgeomError::Construction`](ogeom_core::OgeomError::Construction) where
 /// either fails.
 pub(crate) fn solid_fits(model: &Model, solid: &Shape, tol: Tolerances) -> OgeomResult<()> {
+    solid_fits_beside(model, solid, None, tol)
+}
+
+/// [`solid_fits`], a fold the solid the blend was asked on already holds
+/// there let stand: a thin wall of the given body running out to nothing
+/// between two drums touching (a slot's floor met by a groove) is not the
+/// blend's to answer for, wherever it stands.
+///
+/// # Errors
+///
+/// As [`solid_fits`], for a fold `given` does not hold.
+pub(crate) fn solid_fits_given(
+    model: &Model,
+    solid: &Shape,
+    given: &Shape,
+    tol: Tolerances,
+) -> OgeomResult<()> {
+    solid_fits_beside(model, solid, Some(given), tol)
+}
+
+fn solid_fits_beside(
+    model: &Model,
+    solid: &Shape,
+    given: Option<&Shape>,
+    tol: Tolerances,
+) -> OgeomResult<()> {
     let mut found = ogeom_algo::check(model, solid, tol)?;
     INHERITED.with(|held| {
         if let Some(inherited) = held.borrow().as_ref() {
@@ -275,30 +301,77 @@ pub(crate) fn solid_fits(model: &Model, solid: &Shape, tol: Tolerances) -> Ogeom
     }
     for e in explore_unique(model, solid, ShapeType::Edge)? {
         let faces = ogeom_topo::ancestors_of(model, solid, &e, ShapeType::Face)?;
-        if let [a, b] = faces.as_slice() {
-            if as_it_came(&e, a, b) {
-                continue;
-            }
-            // Read at the edge: a face's normal at its own middle says
-            // nothing of how it meets a neighbour (a half drum's wall faces
-            // away from the flat it meets square).
-            let Some((curve, (lo, hi))) = ogeom_algo::placed_edge_curve(model, &e, tol)? else {
-                continue;
-            };
-            let at = curve.point_at(f64::midpoint(lo, hi), tol)?;
-            let (na, nb) = (
-                normal_near(model, a, at, tol)?,
-                normal_near(model, b, at, tol)?,
-            );
-            if na.dot(nb) < -1.0 + tol.angular() && may_coincide(model, a, b) {
-                ogeom_bail!(
-                    Construction,
-                    "two faces of the blended solid lie folded flat on one another"
-                );
-            }
+        if let [a, b] = faces.as_slice()
+            && as_it_came(&e, a, b)
+        {
+            continue;
         }
+        let Some(at) = folded_at(model, solid, &e, tol)? else {
+            continue;
+        };
+        if let Some(given) = given
+            && folded_through(model, given, at, tol)?
+        {
+            continue;
+        }
+        ogeom_bail!(
+            Construction,
+            "two faces of the blended solid lie folded flat on one another"
+        );
     }
     Ok(())
+}
+
+/// Where `edge`'s two faces in `solid` lie folded flat on one another, read
+/// at its middle: one surface kind, facing opposite ways there.
+fn folded_at(
+    model: &Model,
+    solid: &Shape,
+    edge: &Shape,
+    tol: Tolerances,
+) -> OgeomResult<Option<Point>> {
+    let faces = ogeom_topo::ancestors_of(model, solid, edge, ShapeType::Face)?;
+    let [a, b] = faces.as_slice() else {
+        return Ok(None);
+    };
+    // Read at the edge: a face's normal at its own middle says nothing of
+    // how it meets a neighbour (a half drum's wall faces away from the flat
+    // it meets square).
+    let Some((curve, (lo, hi))) = ogeom_algo::placed_edge_curve(model, edge, tol)? else {
+        return Ok(None);
+    };
+    let at = curve.point_at(f64::midpoint(lo, hi), tol)?;
+    let (na, nb) = (
+        normal_near(model, a, at, tol)?,
+        normal_near(model, b, at, tol)?,
+    );
+    Ok((na.dot(nb) < -1.0 + tol.angular() && may_coincide(model, a, b)).then_some(at))
+}
+
+/// Whether an edge of `solid` runs through `at` with its two faces folded
+/// flat on one another there.
+fn folded_through(model: &Model, solid: &Shape, at: Point, tol: Tolerances) -> OgeomResult<bool> {
+    for e in explore_unique(model, solid, ShapeType::Edge)? {
+        let Some((curve, range)) = ogeom_algo::placed_edge_curve(model, &e, tol)? else {
+            continue;
+        };
+        let t = super::trimmed::param_on(&curve, range, at, tol)?;
+        if curve.point_at(t, tol)?.distance(at) > tol.confusion() {
+            continue;
+        }
+        let faces = ogeom_topo::ancestors_of(model, solid, &e, ShapeType::Face)?;
+        let [a, b] = faces.as_slice() else {
+            continue;
+        };
+        let (na, nb) = (
+            normal_near(model, a, at, tol)?,
+            normal_near(model, b, at, tol)?,
+        );
+        if na.dot(nb) < -1.0 + tol.angular() && may_coincide(model, a, b) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the polygon `pts` crosses itself: two edges not next to each

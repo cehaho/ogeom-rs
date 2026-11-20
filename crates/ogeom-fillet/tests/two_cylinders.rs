@@ -258,3 +258,131 @@ fn a_concave_round_ends_on_a_leaning_floor_beside_a_hole() {
         fill * length
     );
 }
+
+/// A crescent's upper half, ten tall: inside a drum of radius 5 and outside
+/// one of radius 3 standing in it tangent at `(5, 0)`, cut along `y = 0`.
+/// Its horn runs out to nothing at `(5, 0)`: the two walls meet there
+/// facing opposite ways, a cusp of the body as given. The corner where the
+/// outer drum meets the cut at `(-5, 0)` rounds at 0.5 through the engine
+/// with no boolean, valid, the cusp left as it was: the guard against faces
+/// the blend folds flat reads a fold the given body already holds there as
+/// none of the blend's (it refused the round before).
+#[test]
+fn a_round_beside_a_cusp_of_the_given_body_is_not_refused_for_it() {
+    use ogeom_geom::{CircleCurve, Curve, LineCurve, PlaneSurface};
+    use ogeom_math::{Circle, Plane, Vector};
+    let mut model = Model::new();
+    let (tip, outer_end, inner_end) = (
+        Point::new(5.0, 0.0, 0.0),
+        Point::new(-5.0, 0.0, 0.0),
+        Point::new(-1.0, 0.0, 0.0),
+    );
+    let vertices: Vec<Shape> = [tip, outer_end, inner_end]
+        .iter()
+        .map(|&p| ogeom_algo::make_vertex(&mut model, p).shape)
+        .collect();
+    let pi = core::f64::consts::PI;
+    // The outer drum's arc from the tip over to `(-5, 0)`, the cut, and the
+    // inner drum's arc from `(-1, 0)` over back to the tip.
+    let outer = Circle::new(Frame::WORLD, 5.0, T).unwrap();
+    let inner = Circle::new(
+        Frame::new(
+            Point::new(2.0, 0.0, 0.0),
+            -Direction::Z,
+            -Direction::X,
+            T,
+        )
+        .unwrap(),
+        3.0,
+        T,
+    )
+    .unwrap();
+    let sides = [
+        (Curve::Circle(CircleCurve::new(outer)), (0.0, pi), 0, 1),
+        (
+            Curve::Line(LineCurve::segment(outer_end, inner_end, T).unwrap()),
+            (0.0, 4.0),
+            1,
+            2,
+        ),
+        (Curve::Circle(CircleCurve::new(inner)), (0.0, pi), 2, 0),
+    ];
+    let mut profile = Vec::new();
+    for (curve, range, from, to) in sides {
+        profile.push(
+            ogeom_algo::make_edge_between(
+                &mut model,
+                curve,
+                range,
+                &vertices[from],
+                &vertices[to],
+                T,
+            )
+            .unwrap()
+            .shape,
+        );
+    }
+    let wire = ogeom_algo::make_wire(&mut model, &profile, T)
+        .unwrap()
+        .shape;
+    let face = ogeom_algo::make_face(
+        &mut model,
+        PlaneSurface::new(Plane::new(Frame::WORLD)).into(),
+        &[wire],
+        T,
+    )
+    .unwrap()
+    .shape;
+    let solid = ogeom_algo::make_prism(&mut model, &face, Vector::new(0.0, 0.0, 10.0), T)
+        .unwrap()
+        .shape;
+    let given = ogeom_algo::check(&model, &solid, T).unwrap();
+    assert!(given.is_valid(), "{:?}", given.problems);
+    let corner = explore_unique(&model, &solid, ShapeType::Edge)
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            let bb = ogeom_algo::shape_bounds(&model, e, T).unwrap();
+            let (l, h) = (bb.low().unwrap(), bb.high().unwrap());
+            (l.x + 5.0).abs() < 1e-6
+                && (h.x + 5.0).abs() < 1e-6
+                && l.y.abs() < 1e-6
+                && h.y.abs() < 1e-6
+                && (h.z - l.z - 10.0).abs() < 1e-6
+        })
+        .expect("the corner at (-5, 0)");
+    let (built, work) = ogeom_bool::work::counted(|| {
+        ogeom_fillet::fillet_edges(&mut model, &solid, &[corner], 0.5, T).unwrap()
+    });
+    assert_eq!(work.face_pairs, 0, "built with no boolean");
+    let check = ogeom_algo::check(&model, &built.shape, T).unwrap();
+    assert!(check.is_valid(), "{:?}", check.problems);
+    // The spandrel taken off: a quarter-turn corner between the cut and a
+    // drum of 5, its ball's centre at `(-4.5 cos a, 0.5)` off the axis with
+    // `|c| = 4.5`, the foot on the cut `(x0, 0)` and on the drum `c 5 / 4.5`.
+    let cx = -(4.5_f64 * 4.5 - 0.25).sqrt();
+    let foot = Point::new(cx * 5.0 / 4.5, 0.5 * 5.0 / 4.5, 0.0);
+    let (p, l) = (outer_end, Point::new(cx, 0.0, 0.0));
+    let triangle = 0.5 * ((l.x - p.x) * (foot.y - p.y) - (foot.x - p.x) * (l.y - p.y)).abs();
+    let segment = |radius: f64, cos: f64| {
+        let phi = cos.clamp(-1.0, 1.0).acos();
+        0.5 * radius * radius * (phi - phi.sin())
+    };
+    let wall = segment(5.0, (foot.x * p.x + foot.y * p.y) / 25.0);
+    let ball = {
+        let (u, w) = (l - Point::new(cx, 0.5, 0.0), foot - Point::new(cx, 0.5, 0.0));
+        segment(0.5, u.dot(w) / 0.25)
+    };
+    let spandrel = triangle + wall - ball;
+    let volume = |s: &Shape| {
+        ogeom_algo::volume_properties(&model, s, ogeom_mesh::Deflection::default(), T)
+            .unwrap()
+            .mass
+    };
+    let taken = volume(&solid) - volume(&built.shape);
+    assert!(
+        (taken - spandrel * 10.0).abs() < 1e-6,
+        "{taken} against {}",
+        spandrel * 10.0
+    );
+}
