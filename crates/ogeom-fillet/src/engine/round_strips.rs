@@ -1311,12 +1311,14 @@ fn contacts_on_faces(
         let contact = &strip.contacts[k];
         let (mut lo, mut hi) = contact.domain();
         // A straight contact runs on past the edge's ends: only its piece
-        // between them is the strip's.
-        if let Curve::Line(_) = contact {
+        // between them is the strip's. Its parameter is the length along
+        // its axis, read there: its domain need not reach 0 or 1 (a contact
+        // shorter than a unit, a line not starting at its axis's origin).
+        if let Curve::Line(line) = contact {
             let e = &curved.edges[&strip.edge];
-            let o = contact.point_at(0.0, tol)?;
-            let d = contact.point_at(1.0, tol)? - o;
-            let at = |v: Id| (curved.points[&v] - o).dot(d) / d.dot(d);
+            let axis = line.axis();
+            let along = axis.direction.vector();
+            let at = |v: Id| along.dot(curved.points[&v] - axis.location);
             let (ta, tb) = (at(e.ends.0), at(e.ends.1));
             (lo, hi) = (ta.min(tb), ta.max(tb));
         }

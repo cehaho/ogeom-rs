@@ -23,17 +23,43 @@ fn at(x: f64, y: f64, z: f64) -> Frame {
 /// the wall's segment over `CP`, less the ball's over `LC`.
 #[test]
 fn a_flat_drum_s_straight_edge_rounds_past_a_hole_within_its_spandrel() {
+    flat_drum_past_a_hole(1.0);
+}
+
+/// The same drum at a twentieth of its size: an edge half a unit long, its
+/// strip's straight contacts, run two radii past each end, short of the
+/// parameter 1. Their piece between the edge's ends is read along their
+/// axis, not at the parameters 0 and 1 (which the contact does not reach:
+/// a domain error, refused, before).
+#[test]
+fn a_small_flat_drum_s_straight_edge_rounds_past_a_hole_within_its_spandrel() {
+    flat_drum_past_a_hole(0.05);
+}
+
+/// [`a_flat_drum_s_straight_edge_rounds_past_a_hole_within_its_spandrel`]
+/// with every length times `k`.
+fn flat_drum_past_a_hole(k: f64) {
     let mut m = Model::new();
-    let drum = ogeom_algo::make_cylinder(&mut m, at(0.0, 0.0, 0.0), 5.0, 10.0, T)
+    let drum = ogeom_algo::make_cylinder(&mut m, at(0.0, 0.0, 0.0), 5.0 * k, 10.0 * k, T)
         .unwrap()
         .shape;
-    let beyond = ogeom_algo::make_box(&mut m, at(3.0, -6.0, -1.0), (3.0, 12.0, 12.0), T)
-        .unwrap()
-        .shape;
+    let beyond = ogeom_algo::make_box(
+        &mut m,
+        at(3.0 * k, -6.0 * k, -k),
+        (3.0 * k, 12.0 * k, 12.0 * k),
+        T,
+    )
+    .unwrap()
+    .shape;
     let flat = ogeom_bool::cut(&mut m, &drum, &beyond, T).unwrap().shape;
-    let hole = ogeom_algo::make_box(&mut m, at(2.85, 3.6, 7.0), (0.1, 0.15, 4.0), T)
-        .unwrap()
-        .shape;
+    let hole = ogeom_algo::make_box(
+        &mut m,
+        at(2.85 * k, 3.6 * k, 7.0 * k),
+        (0.1 * k, 0.15 * k, 4.0 * k),
+        T,
+    )
+    .unwrap()
+    .shape;
     let s = ogeom_bool::cut(&mut m, &flat, &hole, T).unwrap().shape;
     let edge = explore_unique(&m, &s, ShapeType::Edge)
         .unwrap()
@@ -41,15 +67,15 @@ fn a_flat_drum_s_straight_edge_rounds_past_a_hole_within_its_spandrel() {
         .find(|e| {
             let bb = ogeom_algo::shape_bounds(&m, e, T).unwrap();
             let (l, h) = (bb.low().unwrap(), bb.high().unwrap());
-            (l.x - 3.0).abs() < 1e-6
-                && (h.x - 3.0).abs() < 1e-6
-                && (l.y - 4.0).abs() < 1e-6
-                && (h.y - 4.0).abs() < 1e-6
-                && (h.z - l.z - 10.0).abs() < 1e-5
+            (l.x - 3.0 * k).abs() < 1e-6
+                && (h.x - 3.0 * k).abs() < 1e-6
+                && (l.y - 4.0 * k).abs() < 1e-6
+                && (h.y - 4.0 * k).abs() < 1e-6
+                && (h.z - l.z - 10.0 * k).abs() < 1e-5
         })
         .expect("the straight edge at (3, 4)");
     let built =
-        ogeom_fillet::fillet_edges(&mut m, &s, std::slice::from_ref(&edge), 2.0, T).unwrap();
+        ogeom_fillet::fillet_edges(&mut m, &s, std::slice::from_ref(&edge), 2.0 * k, T).unwrap();
     let found = ogeom_algo::check(&m, &built.shape, T).unwrap();
     assert!(found.is_valid(), "{:?}", found.problems);
     let r2 = 2.0_f64.sqrt();
@@ -63,10 +89,10 @@ fn a_flat_drum_s_straight_edge_rounds_past_a_hole_within_its_spandrel() {
     let ball = segment(2.0, 1.0 / 3.0);
     let spandrel = triangle + wall - ball;
     let flat_area = 25.0 * core::f64::consts::PI - 25.0 * 0.6_f64.acos() + 12.0;
-    let want = (flat_area - spandrel) * 10.0;
+    let want = (flat_area - spandrel) * 10.0 * k.powi(3);
     let got = ogeom_algo::volume_properties(&m, &built.shape, ogeom_mesh::Deflection::default(), T)
         .unwrap()
         .mass;
-    assert!((got - want).abs() < 1e-6, "{got} against {want}");
+    assert!((got - want).abs() < 1e-6 * k.powi(3), "{got} against {want}");
     assert!(!built.history.generated(&edge).is_empty(), "the strip");
 }
