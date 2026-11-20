@@ -2434,17 +2434,42 @@ pub(crate) fn face_mesh(
 
 /// Whether a chart point lies in a face's region: inside one of the
 /// triangles its own mesh lays over its chart, or on one's side.
+///
+/// In a direction the face's surface is periodic in, the point is first
+/// brought within half a period of the mesh's own span: a projection or a
+/// seat solve reads a drum's angle in the surface's domain, while the
+/// face's chart may stand a period off it (a face whose pcurves run at
+/// negative angles).
 pub(crate) fn chart_holds(
     model: &Model,
     face: &Shape,
     at: ogeom_math::Point2,
     tol: Tolerances,
 ) -> OgeomResult<bool> {
+    use ogeom_geom::Surface as _;
     let mesh = face_mesh(model, face, tol)?;
     let triangles: Vec<[ogeom_math::Point2; 3]> = (0..mesh.triangles.len())
         .filter_map(|i| mesh.triangle_parameters(i))
         .map(|t| t.map(|(u, v)| ogeom_math::Point2::new(u, v)))
         .collect();
+    let mut at = at;
+    if let Some(NodeData::Face(data)) = model.node(face).map(|n| n.data())
+        && let Some(surface) = model.geometry().surface(data.surface)
+        && !triangles.is_empty()
+    {
+        let ((ua, ub), (va, vb)) = surface.domain();
+        let near = |x: f64, period: f64, values: &mut dyn Iterator<Item = f64>| {
+            let (lo, hi) = values.fold((f64::MAX, f64::MIN), |(l, h), w| (l.min(w), h.max(w)));
+            let mid = f64::midpoint(lo, hi);
+            mid + (x - mid + 0.5 * period).rem_euclid(period) - 0.5 * period
+        };
+        if surface.is_periodic_u() && ub - ua > 0.0 && at.x.is_finite() {
+            at.x = near(at.x, ub - ua, &mut triangles.iter().flatten().map(|p| p.x));
+        }
+        if surface.is_periodic_v() && vb - va > 0.0 && at.y.is_finite() {
+            at.y = near(at.y, vb - va, &mut triangles.iter().flatten().map(|p| p.y));
+        }
+    }
     let span = triangles
         .iter()
         .flatten()
@@ -2642,4 +2667,48 @@ pub(crate) fn run_out_past(
         k += 1.0;
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+    use super::chart_holds;
+    use ogeom_core::Tolerances;
+    use ogeom_math::{Direction, Frame, Point, Point2};
+    use ogeom_topo::{Model, ShapeType, explore_unique};
+
+    const T: Tolerances = Tolerances::millimetres();
+
+    /// A drum's wall holds a point read a period off its chart, either way,
+    /// as it holds the point itself: an angle read in the surface's domain
+    /// names the same place a turn on (a face whose chart runs at negative
+    /// angles was refused for a contact on it). Its height is not periodic:
+    /// a point above the wall stays off it.
+    #[test]
+    fn a_drum_s_wall_holds_its_point_a_turn_off_its_chart() {
+        let mut model = Model::new();
+        let frame = Frame::new(Point::ORIGIN, Direction::Z, Direction::X, T).unwrap();
+        let drum = ogeom_algo::make_cylinder(&mut model, frame, 2.0, 3.0, T)
+            .unwrap()
+            .shape;
+        let wall = explore_unique(&model, &drum, ShapeType::Face)
+            .unwrap()
+            .into_iter()
+            .find(|f| {
+                let data = model.node(f).unwrap().data().as_face().unwrap();
+                matches!(
+                    model.geometry().surface(data.surface),
+                    Some(ogeom_geom::SurfaceGeometry::Cylinder(_))
+                )
+            })
+            .unwrap();
+        let turn = core::f64::consts::TAU;
+        for u in [1.0, 1.0 + turn, 1.0 - turn, 1.0 + 2.0 * turn] {
+            assert!(
+                chart_holds(&model, &wall, Point2::new(u, 1.5), T).unwrap(),
+                "at u = {u}"
+            );
+        }
+        assert!(!chart_holds(&model, &wall, Point2::new(1.0, 4.5), T).unwrap());
+    }
 }
