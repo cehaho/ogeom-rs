@@ -1607,10 +1607,40 @@ fn proved(
             })
             .collect(),
     };
-    let others: Vec<(usize, PointDistance)> = (0..curved.faces.len())
-        .filter(|fi| *fi != run.faces[0] && (uncut || !run.end_faces.contains(fi)))
-        .map(|fi| Ok((fi, PointDistance::of(model, &curved.faces[fi].shape, tol)?)))
-        .collect::<OgeomResult<_>>()?;
+    // A face whose bounds stand a radius or more from every centre of the
+    // run stands clear of it at every station and between them, read
+    // without measuring it: the centres between two stations stay within
+    // half their chord of them, as `clear_between` takes them to. On a
+    // body of hundreds of faces the rest are few.
+    let reach = {
+        let (lo, hi) = run.span;
+        #[expect(clippy::cast_precision_loss, reason = "a few stations")]
+        let step = (hi - lo) / (PROOF as f64);
+        #[expect(clippy::cast_precision_loss, reason = "a few stations")]
+        let centres: Option<Vec<Point>> = (0..=PROOF)
+            .map(|i| run.centre(lo + step * (i as f64)))
+            .collect();
+        centres.map(|centres| {
+            let room = centres
+                .windows(2)
+                .map(|w| 0.5 * w[0].distance(w[1]) * 1.01)
+                .fold(0.0, f64::max);
+            ogeom_math::Aabb::of_points(&centres).expanded(room)
+        })
+    };
+    let mut others: Vec<(usize, PointDistance)> = Vec::new();
+    for fi in 0..curved.faces.len() {
+        if fi == run.faces[0] || (!uncut && run.end_faces.contains(&fi)) {
+            continue;
+        }
+        let shape = &curved.faces[fi].shape;
+        if let Some(reach) = &reach
+            && reach.distance_to_box(&ogeom_algo::shape_bounds(model, shape, tol)?) >= run.radius
+        {
+            continue;
+        }
+        others.push((fi, PointDistance::of(model, shape, tol)?));
+    }
     // A planar face wholly behind a plane the ball touches stands a radius
     // or more from every centre, which stands a radius in front of it.
     let mut planes = vec![(run.start, run.n1)];
