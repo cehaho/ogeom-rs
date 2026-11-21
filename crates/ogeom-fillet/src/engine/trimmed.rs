@@ -2374,7 +2374,8 @@ fn resting_region(
             return Ok(None);
         };
         // Into the other face from the edge: on the left of the edge as
-        // that face walks it, about its outward normal.
+        // that face walks it in the solid (the way its loop reads, a
+        // reversed face's turned already), about its outward normal.
         let Some(&(_, w)) = curved.faces[g]
             .loops
             .iter()
@@ -2383,11 +2384,7 @@ fn resting_region(
         else {
             return Ok(None);
         };
-        let walk = if w == curved.faces[g].reversed {
-            -tangent
-        } else {
-            tangent
-        };
+        let walk = if w { tangent } else { -tangent };
         let into = n_g.cross(walk);
         if n_left.dot(into) > 0.0 {
             convex = false;
@@ -4033,8 +4030,24 @@ fn assemble_widened(
                     )
                 } else {
                     let (pa, pb) = (sharp_end[&(*e, vs)], sharp_end[&(*e, ve)]);
-                    let ta = param_on(&edge.curve, edge.range, pa, tol)?;
-                    let tb = param_on(&edge.curve, edge.range, pb, tol)?;
+                    // An edge closing on its one vertex, left there at both
+                    // ends, runs its own range: read again by projection,
+                    // both ends land on the one foot, and an open curve's
+                    // sliver (a file's edge shorter than its vertex, the
+                    // two merged) comes out a single point.
+                    let unmoved = |p: Point| p.distance(curved.points[&vs]) <= 0.0;
+                    let (ta, tb) = if edge.ends.0 == edge.ends.1 && unmoved(pa) && unmoved(pb) {
+                        if forward {
+                            edge.range
+                        } else {
+                            (edge.range.1, edge.range.0)
+                        }
+                    } else {
+                        (
+                            param_on(&edge.curve, edge.range, pa, tol)?,
+                            param_on(&edge.curve, edge.range, pb, tol)?,
+                        )
+                    };
                     (edge.curve.clone(), (pa, ta), (pb, tb), Key::Sharp(*e))
                 };
                 // Where the last piece stopped short of this one, a
