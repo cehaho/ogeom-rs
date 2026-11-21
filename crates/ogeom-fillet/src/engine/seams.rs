@@ -301,6 +301,23 @@ impl Seamless {
                 .map(|(w, _)| *w);
             vertices.insert(*v, at);
         }
+        // Each unified edge's guaranteed bound over its range, grown past
+        // `near`: a probe outside it lies farther than `near` from every
+        // point of the edge, so the edge cannot hold it, and is passed over
+        // without the search along it. Every input edge was otherwise
+        // searched along every unified edge (a 2455-edge ring: six million
+        // searches).
+        let reach = near * 2.0;
+        let held: Vec<(&Id, &super::curved::CurvedEdge, Option<ogeom_math::Aabb>)> = unified
+            .edges
+            .iter()
+            .map(|(f, other)| {
+                let bound = ogeom_algo::curve_bounds_over(&other.curve, other.range, tol)
+                    .ok()
+                    .map(|b| b.expanded(reach));
+                (f, other, bound)
+            })
+            .collect();
         let mut edges: FastMap<Id, Option<Id>> = FastMap::default();
         for (e, edge) in &input.edges {
             let mid = edge
@@ -308,7 +325,13 @@ impl Seamless {
                 .point_at(f64::midpoint(edge.range.0, edge.range.1), tol)?;
             let probes = [input.points[&edge.ends.0], input.points[&edge.ends.1], mid];
             let mut along = None;
-            for (f, other) in &unified.edges {
+            for (f, other, bound) in &held {
+                if bound
+                    .as_ref()
+                    .is_some_and(|b| probes.iter().any(|p| !b.contains(*p)))
+                {
+                    continue;
+                }
                 let mut on = true;
                 for p in probes {
                     let t = super::trimmed::param_on(&other.curve, other.range, p, tol)?;
@@ -318,7 +341,7 @@ impl Seamless {
                     }
                 }
                 if on {
-                    along = Some(*f);
+                    along = Some(**f);
                     break;
                 }
             }
