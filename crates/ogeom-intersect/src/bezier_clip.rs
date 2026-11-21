@@ -144,24 +144,39 @@ impl Patches {
         net[i * (self.q + 1) + j]
     }
 
-    /// How far the net's first and last rows stand apart each way.
+    /// How far the net runs each way: the longest of its control polygons
+    /// along `u`, and along `v`.
+    ///
+    /// The polygon's length, not the distance between its ends: a patch
+    /// closed in one direction (a whole turn of a swept profile in one
+    /// Bézier span) has its first and last rows on top of each other, and
+    /// read by its ends it runs nowhere that way. Halved only across the
+    /// other, a sliver a few nanometres wide, its boxes never shrank, and
+    /// every half met a segment through the turn down to the deepest
+    /// level: 2^24 seeds for one segment.
     fn extents(&self, net: &[Weighted<Point>]) -> (f64, f64) {
         let (p, q) = (self.p, self.q);
         let mut along_u: f64 = 0.0;
         let mut along_v: f64 = 0.0;
         for j in 0..=q {
-            along_u = along_u.max(
-                self.at(net, 0, j)
-                    .point()
-                    .distance(self.at(net, p, j).point()),
-            );
+            let length: f64 = (0..p)
+                .map(|i| {
+                    self.at(net, i, j)
+                        .point()
+                        .distance(self.at(net, i + 1, j).point())
+                })
+                .sum();
+            along_u = along_u.max(length);
         }
         for i in 0..=p {
-            along_v = along_v.max(
-                self.at(net, i, 0)
-                    .point()
-                    .distance(self.at(net, i, q).point()),
-            );
+            let length: f64 = (0..q)
+                .map(|j| {
+                    self.at(net, i, j)
+                        .point()
+                        .distance(self.at(net, i, j + 1).point())
+                })
+                .sum();
+            along_v = along_v.max(length);
         }
         (along_u, along_v)
     }
@@ -279,4 +294,48 @@ pub(crate) fn segment_meets_box(a: Point, b: Point, low: Point, high: Point, mar
         }
     }
     true
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ogeom_math::{ControlGrid, KnotVector};
+
+    const T: Tolerances = Tolerances::millimetres();
+
+    #[test]
+    fn a_patch_closed_one_way_is_halved_that_way() {
+        // One Bézier span closing a whole loop along `u` (its first and
+        // last rows on top of each other), a nanometre deep along `v`: a
+        // sweep's last sliver of a span, as an imported ring carries. Read
+        // by the ends of its rows it ran nowhere along `u`, was halved only
+        // across the sliver, and every half met a segment through the
+        // loop down to the deepest level.
+        let mut points = Vec::new();
+        for i in 0..7 {
+            let a = core::f64::consts::TAU * f64::from(i) / 6.0;
+            for j in 0..2 {
+                points.push(Point::new(2.0 * a.cos(), 1e-9 * f64::from(j), 2.0 * a.sin()));
+            }
+        }
+        let loop_ = BSplineSurface::new(
+            KnotVector::clamped_uniform(6, 7).unwrap(),
+            KnotVector::clamped_uniform(1, 2).unwrap(),
+            &ControlGrid::new(points, 7, 2).unwrap(),
+            T,
+        )
+        .unwrap();
+        let patches = Patches::of(&loop_, T).unwrap().unwrap();
+        // Through the middle of the loop, clear of the surface.
+        let seeds = patches.seeds(Point::new(0.1, -1.0, 0.2), Point::new(0.1, 1.0, 0.2), 1e-7);
+        assert!(seeds.len() <= 64, "{} seeds", seeds.len());
+        // Across the band, through the loop's wall twice.
+        let seeds = patches.seeds(
+            Point::new(-3.0, 0.5e-9, 0.05),
+            Point::new(3.0, 0.5e-9, 0.05),
+            1e-7,
+        );
+        assert!(!seeds.is_empty() && seeds.len() <= 4096, "{} seeds", seeds.len());
+    }
 }
