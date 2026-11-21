@@ -671,6 +671,169 @@ pub fn fit_points_at(
     fit_points_at_inner(parameters, points, degree, tolerance, false, tol)
 }
 
+/// The knots of a spline through `parameters` broken at the parameters
+/// whose places `joints` names (increasing, inside): each piece between two
+/// breaks on the knots the spline through its own parameters alone stands
+/// on (each interior knot the average of `degree` consecutive parameters,
+/// [`interpolating_knots`]), each break a knot of `multiplicity`. At the
+/// degree the pieces join C0 and the spline through every parameter is
+/// square; each multiplicity less leaves one parameter more than control
+/// points per break, which least squares spreads.
+fn joined_knots(
+    degree: usize,
+    parameters: &[f64],
+    joints: &[usize],
+    multiplicity: usize,
+) -> OgeomResult<KnotVector> {
+    let n = parameters.len();
+    let ends: Vec<usize> = std::iter::once(0)
+        .chain(joints.iter().copied())
+        .chain(std::iter::once(n - 1))
+        .collect();
+    if ends.windows(2).any(|w| w[1] < w[0] + degree + 1) {
+        ogeom_bail!(
+            Construction,
+            "each piece of a broken fit needs {} parameters at least",
+            degree + 2
+        );
+    }
+    let mut knots = vec![parameters[0]; degree + 1];
+    for (k, w) in ends.windows(2).enumerate() {
+        for j in w[0] + 1..=w[1] - degree {
+            #[allow(clippy::cast_precision_loss, reason = "a small count")]
+            let mean = parameters[j..j + degree].iter().sum::<f64>() / degree as f64;
+            knots.push(mean);
+        }
+        if k + 2 < ends.len() {
+            knots.extend(std::iter::repeat_n(parameters[w[1]], multiplicity.clamp(1, degree)));
+        }
+    }
+    knots.extend(std::iter::repeat_n(parameters[n - 1], degree + 1));
+    KnotVector::new(knots, degree)
+}
+
+/// Fit space points at *fixed* parameters through every one of them, the
+/// spline broken at the points `joints` names (their places, increasing,
+/// strictly inside) by a knot of `multiplicity`: where the trace turns its
+/// curvature at once (a path passing from a cylinder onto a tangent
+/// torus), a spline smooth across the turn sags off the trace between the
+/// points about it however close they stand, and one broken there follows
+/// each side on its own. Between two breaks the knots are those of the
+/// spline through that piece's points alone. At `degree` the pieces join
+/// C0 and the spline passes every point; a multiplicity of `degree - 1`
+/// joins them C1, one control point fewer per break, and the error is
+/// that of least squares at the points. The error is measured at the
+/// points only, and `met` says whether it is within `tolerance`.
+///
+/// # Errors
+///
+/// [`OgeomError::Construction`](ogeom_core::OgeomError::Construction) if
+/// the parameters do not strictly increase, one per point, or a piece
+/// holds fewer than `degree + 2` points.
+pub fn fit_points_through_joints(
+    parameters: &[f64],
+    points: &[Point],
+    degree: usize,
+    joints: &[usize],
+    multiplicity: usize,
+    tolerance: f64,
+    tol: Tolerances,
+) -> OgeomResult<Fitted<BSplineCurve>> {
+    if parameters.len() != points.len() || parameters.windows(2).any(|w| w[1] <= w[0]) {
+        ogeom_bail!(
+            Construction,
+            "fixed parameters must strictly increase, one per point"
+        );
+    }
+    if degree == 0 {
+        ogeom_bail!(Construction, "a fit needs a degree of at least one");
+    }
+    let data: Vec<[f64; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+    let knots = joined_knots(degree, parameters, joints, multiplicity)?;
+    let control = least_squares::<3>(&knots, &data, parameters, false)?;
+    let error = residuals::<3>(&knots, &control, &data, parameters)
+        .iter()
+        .fold(0.0_f64, |acc, e| acc.max(e.1));
+    Ok(Fitted {
+        curve: build_curve_3(knots, control, tol)?,
+        error,
+        met: error <= tolerance,
+    })
+}
+
+/// Fit a rectangular grid at *fixed* parameters through every point, as
+/// [`fit_points_through_joints`] across the rows: each row through its
+/// points on the knots of the spline through the `u` parameters, then the
+/// columns of control points broken at the rows `v_joints` names. The
+/// error is the surface against every point at its parameters, and `met`
+/// whether it is within `tolerance`.
+///
+/// `rows[j][i]` runs `i` along `u` and `j` along `v`.
+///
+/// # Errors
+///
+/// As [`fit_points_through_joints`] each way.
+pub fn fit_surface_grid_through_joints(
+    u_params: &[f64],
+    v_params: &[f64],
+    rows: &[Vec<Point>],
+    degree: usize,
+    v_joints: &[usize],
+    multiplicity: usize,
+    tolerance: f64,
+    tol: Tolerances,
+) -> OgeomResult<Fitted<crate::BSplineSurface>> {
+    use crate::traits::Surface as _;
+    if rows.len() != v_params.len()
+        || u_params.len() < 2
+        || rows.iter().any(|r| r.len() != u_params.len())
+    {
+        ogeom_bail!(
+            Construction,
+            "a surface fit needs a rectangular grid, one parameter per row and per column"
+        );
+    }
+    if u_params.windows(2).any(|w| w[1] <= w[0]) || v_params.windows(2).any(|w| w[1] <= w[0]) {
+        ogeom_bail!(Construction, "fixed parameters must strictly increase");
+    }
+    let u_degree = degree.min(u_params.len() - 1).max(1);
+    let u_knots = interpolating_knots(u_degree, u_params)?;
+    let row_controls: Vec<Vec<[f64; 3]>> = rows
+        .iter()
+        .map(|r| {
+            let raw: Vec<[f64; 3]> = r.iter().map(|p| [p.x, p.y, p.z]).collect();
+            least_squares::<3>(&u_knots, &raw, u_params, false)
+        })
+        .collect::<OgeomResult<_>>()?;
+    let v_knots = joined_knots(degree, v_params, v_joints, multiplicity)?;
+    let k = u_knots.control_point_count();
+    let mut columns = Vec::with_capacity(k);
+    for i in 0..k {
+        let column: Vec<[f64; 3]> = row_controls.iter().map(|r| r[i]).collect();
+        columns.push(least_squares::<3>(&v_knots, &column, v_params, false)?);
+    }
+    let l = v_knots.control_point_count();
+    let mut net: Vec<Point> = Vec::with_capacity(k * l);
+    for column in &columns {
+        for c in column {
+            net.push(Point::new(c[0], c[1], c[2]));
+        }
+    }
+    let grid = ogeom_math::ControlGrid::new(net, k, l)?;
+    let surface = crate::BSplineSurface::new(u_knots, v_knots, &grid, tol)?;
+    let mut worst = 0.0_f64;
+    for (j, row) in rows.iter().enumerate() {
+        for (i, p) in row.iter().enumerate() {
+            worst = worst.max(surface.point_at(u_params[i], v_params[j], tol)?.distance(*p));
+        }
+    }
+    Ok(Fitted {
+        curve: surface,
+        error: worst,
+        met: worst <= tolerance,
+    })
+}
+
 /// As [`fit_points_at`], with the loop's join made C1: the points close,
 /// the last the first again.
 ///

@@ -17,7 +17,10 @@
 //! holds the centre, found where both distances are the radius. The run's
 //! surface is the balls' arcs fitted along the stations; the contact on the
 //! other face and the centre's path are fitted through the stations too; the
-//! seat on `E` is `E` itself between the crossings, exact.
+//! seat on `E` is `E` itself between the crossings, exact. The fits are read
+//! against the exact balls midway between the stations, which thicken
+//! where they stray; where the seat passes from one edge into the next on
+//! tangent, a station stands at the joint and the fits are broken there.
 
 use ogeom_core::{OgeomResult, Tolerances};
 use ogeom_geom::{Curve, Curve3d as _, SurfaceGeometry};
@@ -49,8 +52,8 @@ pub(crate) struct EdgeRun {
     pub surface: SurfaceGeometry,
     /// The contact on the other face, fitted through the feet.
     pub contact: Curve,
-    /// How far the fitted surface and contact stand off the exact
-    /// stations at most.
+    /// How far the fitted surface and contact stand off the exact balls at
+    /// most: at the stations, and midway between each two.
     pub off: f64,
 }
 
@@ -89,7 +92,7 @@ impl NotSeated {
 /// How close the fit holds the run to its exact stations.
 const RUN_FIT: f64 = 2e-7;
 
-/// The stations a run is first read at; doubled while the fit misses.
+/// The stations a run is first read at; thickened where the fit misses.
 const FIRST_STATIONS: usize = 33;
 
 /// The most stations a run is read at.
@@ -168,24 +171,42 @@ pub(crate) fn edge_run(
         super::trimmed::param_on(spine, spine.domain(), leave.point, tol)?,
     );
     let s1 = the_way_through(spine, s0, s1, through, tol)?;
-    let mut n = FIRST_STATIONS;
+    let ball = |s: f64, guess: Option<Point>| -> OgeomResult<Option<Ball>> {
+        let o = spine.point_at(s, tol)?;
+        let t = spine.d1_at(s, tol)?.normalized(tol)?;
+        let Some(c) = centre_in(face, &nearest, o, t, guess.unwrap_or(o), radius, tol)? else {
+            return Ok(None);
+        };
+        let foot = ogeom_geom::project::project_on_surface(face, c, 16, tol)?;
+        Ok(Some((c, foot.point, nearest(c)?)))
+    };
+    // Where the chain passes from one edge into the next (a line into its
+    // tangent arc) the seat's offset passes from a cylinder onto a torus
+    // tangent to it: the run turns its curvature at once there, and a
+    // cubic smooth across that station sags off the balls between the
+    // stations about it however close they stand. Each joint gets a
+    // station of its own, found from the first stations, and the fits are
+    // broken there.
+    let joints: Vec<(Point, Vector)> = (0..chain.len().saturating_sub(1))
+        .map(|k| {
+            let (lo, hi) = curves[k].domain();
+            let at = if forward_of(curved, &chain, k) { hi } else { lo };
+            Ok((curves[k].point_at(at, tol)?, curves[k].d1_at(at, tol)?))
+        })
+        .collect::<OgeomResult<_>>()?;
+    let mut at_joints: Option<Vec<f64>> = None;
+    let mut stations = spread(s0, s1, &[], FIRST_STATIONS - 1);
     loop {
+        let n = stations.len();
         let mut centres = Vec::with_capacity(n);
         let mut feet = Vec::with_capacity(n);
         let mut on_edge = Vec::with_capacity(n);
         let mut on_params = Vec::with_capacity(n);
         let mut guess: Option<Point> = None;
-        for i in 0..n {
-            #[expect(clippy::cast_precision_loss, reason = "a few stations")]
-            let s = s0 + (s1 - s0) * (i as f64) / ((n - 1) as f64);
-            let o = spine.point_at(s, tol)?;
-            let t = spine.d1_at(s, tol)?.normalized(tol)?;
-            let start = guess.unwrap_or(o);
-            let Some(c) = centre_in(face, &nearest, o, t, start, radius, tol)? else {
+        for (i, &s) in stations.iter().enumerate() {
+            let Some((c, foot, (k, near))) = ball(s, guess)? else {
                 return Ok(Err(NotSeated::NoCentre));
             };
-            let foot = ogeom_geom::project::project_on_surface(face, c, 16, tol)?;
-            let (k, near) = nearest(c)?;
             // The touch on the chain inside it, short of its outer ends.
             let (lo, hi) = curves[k].domain();
             let first_end = if forward_of(curved, &chain, 0) {
@@ -218,40 +239,185 @@ pub(crate) fn edge_run(
                 }
             }
             centres.push(c);
-            feet.push(foot.point);
+            feet.push(foot);
             on_edge.push(near.point);
             on_params.push((k, near.parameter));
             guess = Some(c);
         }
+        let Some(at_joints) = &at_joints else {
+            let found = joint_stations(&ball, &joints, &stations, &centres, &on_params)?;
+            stations = spread(s0, s1, &found, FIRST_STATIONS - 1);
+            at_joints = Some(found);
+            continue;
+        };
+        let joint_rows: Vec<usize> = at_joints
+            .iter()
+            .filter_map(|j| stations.iter().position(|s| s == j))
+            .collect();
         let target = RUN_FIT;
         let rows: Vec<Vec<Point>> = (0..n)
             .map(|i| arc_points(centres[i], feet[i], on_edge[i], radius, tol))
             .collect::<OgeomResult<_>>()?;
-        let surface = ogeom_geom::fit::fit_surface_grid_chordal(&rows, 3, target, tol)?;
-        let contact_fit = ogeom_geom::fit::fit_points(&feet, 3, target, tol)?;
-        let met = surface.met && contact_fit.met;
-        if met || n >= MOST_STATIONS {
-            if !met {
-                ogeom_core::ogeom_bail!(
-                    NotDone,
-                    "a round's ball resting on an edge fits within {} of its stations, against {target}",
-                    surface.error.max(contact_fit.error)
-                );
+        // Along the run, the spine's own parameter: the balls follow it C1
+        // across a joint, where a chord-length parameter averaged over the
+        // arcs (each passing the joint at its own speed) turns its speed at
+        // once, and a fit C1 in it could not follow.
+        let (us, _) = ogeom_geom::fit::grid_parameters(&rows, (true, true))?;
+        let vs: Vec<f64> = stations.iter().map(|s| (s - s0) / (s1 - s0)).collect();
+        let surface = ogeom_geom::fit::fit_surface_grid_through_joints(
+            &us,
+            &vs,
+            &rows,
+            3,
+            &joint_rows,
+            3,
+            target,
+            tol,
+        )?;
+        let contact =
+            ogeom_geom::fit::fit_points_through_joints(&vs, &feet, 3, &joint_rows, 3, target, tol)?;
+        let surface_geometry = SurfaceGeometry::BSpline(surface.curve);
+        let contact_curve = Curve::BSpline(contact.curve);
+        // The fits pass the stations; between them each is read against
+        // the ball midway, its arc's ends and middle and its foot, and the
+        // stations are thickened where it strays.
+        let mut off = surface.error.max(contact.error);
+        let mut strays = Vec::new();
+        for i in 0..n - 1 {
+            let m = 0.5 * (stations[i] + stations[i + 1]);
+            let Some((c, foot, (_, near))) = ball(m, Some(centres[i]))? else {
+                return Ok(Err(NotSeated::NoCentre));
+            };
+            let arc = arc_points(c, foot, near.point, radius, tol)?;
+            let mut miss = ogeom_algo::project_on_curve(&contact_curve, foot, 32, tol)?.distance;
+            for p in [arc[0], arc[ACROSS / 2], arc[ACROSS - 1]] {
+                let d = ogeom_geom::project::project_on_surface(&surface_geometry, p, 16, tol)?;
+                miss = miss.max(d.distance);
             }
-            let off = surface.error.max(contact_fit.error);
+            off = off.max(miss);
+            if miss > target {
+                strays.push(i);
+            }
+        }
+        if off <= target {
             return Ok(Ok(EdgeRun {
                 over: chain,
                 on_over: on_params,
                 centres,
                 feet,
                 on_edge,
-                surface: SurfaceGeometry::BSpline(surface.curve),
-                contact: Curve::BSpline(contact_fit.curve),
+                surface: surface_geometry,
+                contact: contact_curve,
                 off,
             }));
         }
-        n = 2 * n - 1;
+        if strays.is_empty() || n + strays.len() > MOST_STATIONS {
+            ogeom_core::ogeom_bail!(
+                NotDone,
+                "a round's ball resting on an edge fits within {off} of its balls, against {target}"
+            );
+        }
+        for i in strays.into_iter().rev() {
+            stations.insert(i + 1, 0.5 * (stations[i] + stations[i + 1]));
+        }
     }
+}
+
+/// A station's ball: its centre, its foot on the other face, and its touch
+/// on the chain (the edge's place in it and the projection on that edge).
+type Ball = (Point, Point, (usize, ogeom_algo::Projection));
+
+/// The stations of a run from `s0` to `s1` on its spine: `per` intervals
+/// spread evenly, and a station on each of `joints` (in the run's order,
+/// strictly between the two), the intervals then shared out between the
+/// pieces by their lengths, four at least to a piece.
+fn spread(s0: f64, s1: f64, joints: &[f64], per: usize) -> Vec<f64> {
+    let ends: Vec<f64> = std::iter::once(s0)
+        .chain(joints.iter().copied())
+        .chain(std::iter::once(s1))
+        .collect();
+    let whole = (s1 - s0).abs();
+    let mut stations = vec![s0];
+    for w in ends.windows(2) {
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a few stations"
+        )]
+        let m = if joints.is_empty() {
+            per
+        } else {
+            ((per as f64 * (w[1] - w[0]).abs() / whole).round() as usize).max(4)
+        };
+        for i in 1..=m {
+            #[expect(clippy::cast_precision_loss, reason = "a few stations")]
+            let s = if i == m {
+                w[1]
+            } else {
+                w[0] + (w[1] - w[0]) * (i as f64) / (m as f64)
+            };
+            stations.push(s);
+        }
+    }
+    stations
+}
+
+/// The spine parameter of each of `joints` (a vertex of the chain and its
+/// tangent there), in the run's order, where the ball touches the chain at
+/// the vertex itself: its centre in the plane square to the chain there.
+/// Found between the two stations whose touches stand on either side of
+/// it, by bisection on the side of that plane the centre stands. A joint no
+/// two stations bracket, or one on the run's end, is left out.
+///
+/// # Errors
+///
+/// As reading the balls.
+fn joint_stations(
+    ball: &dyn Fn(f64, Option<Point>) -> OgeomResult<Option<Ball>>,
+    joints: &[(Point, Vector)],
+    stations: &[f64],
+    centres: &[Point],
+    on_params: &[(usize, f64)],
+) -> OgeomResult<Vec<f64>> {
+    let mut found = Vec::with_capacity(joints.len());
+    let room = (stations[1] - stations[0]).abs() * 1e-3;
+    let (first, last) = (stations[0], stations[stations.len() - 1]);
+    for (k, (v, t)) in joints.iter().enumerate() {
+        let Some(i) =
+            (0..stations.len() - 1).find(|&i| on_params[i].0 <= k && on_params[i + 1].0 > k)
+        else {
+            continue;
+        };
+        let side = |c: Point| (c - *v).dot(*t);
+        let (mut a, mut b) = (stations[i], stations[i + 1]);
+        let (mut ga, gb) = (side(centres[i]), side(centres[i + 1]));
+        if ga.signum() == gb.signum() {
+            continue;
+        }
+        let mut guess = centres[i];
+        for _ in 0..80 {
+            let m = 0.5 * (a + b);
+            if m == a || m == b {
+                break;
+            }
+            let Some((c, _, _)) = ball(m, Some(guess))? else {
+                break;
+            };
+            let g = side(c);
+            if g.signum() == ga.signum() {
+                (a, ga) = (m, g);
+            } else {
+                b = m;
+            }
+            guess = c;
+        }
+        let at = 0.5 * (a + b);
+        if (at - first).abs() > room && (at - last).abs() > room {
+            found.push(at);
+        }
+    }
+    Ok(found)
 }
 
 /// Where a run from `s0` to `s1` on `spine` ends, the way round passing
