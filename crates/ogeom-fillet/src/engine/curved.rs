@@ -275,6 +275,9 @@ pub(crate) fn build_with_widths(
             let mut grew = false;
             for wire in &wires {
                 let uses = model.children_of(wire)?;
+                if face.rings.len() == 1 {
+                    counter_clockwise_through_poles(model, surface, &uses, tol)?;
+                }
                 let with_poles = ogeom_algo::closed_at_poles(model, surface, &uses, tol)?;
                 grew |= with_poles.len() > uses.len();
                 closed.push(with_poles);
@@ -503,6 +506,166 @@ fn in_one_period(model: &mut Model, face: &Shape, tol: Tolerances) -> OgeomResul
             let shift = -((middle - column) / period).floor() * period;
             shift_pcurve(model, e, id, ogeom_math::Vector2::new(shift, 0.0), tol)?;
         }
+    }
+    Ok(())
+}
+
+/// A face's one ring `uses`, through two poles of a surface periodic in
+/// `u`, carried into one chart, counter-clockwise, as a ring in the
+/// surface's own sense bounds its face.
+///
+/// Each edge's pcurve is fitted on its own, where its projection lands:
+/// one of two arcs along a seam may land a turn from the other, and a
+/// meridian half a turn from another lands in either copy. Between its two
+/// poles the ring is two chains of edges, and the pole runs
+/// [`ogeom_algo::closed_at_poles`] lays across the chart close them round
+/// one half of the surface or the other: a sphere's half bounded by two
+/// meridians, the seam one of them, could enclose its other half, its face
+/// then read inside out. Here each edge is carried the whole turns that
+/// start it where the one before it ends, but across a pole, and the chain
+/// after the first pole the turn that winds the ring counter-clockwise. A
+/// ring that does not break at exactly two poles, that breaks anywhere but
+/// at a pole or by whole turns, or whose edges are not each on one pcurve,
+/// is left as it is.
+///
+/// # Errors
+///
+/// As evaluating the pcurves and the surface.
+fn counter_clockwise_through_poles(
+    model: &mut Model,
+    surface: ogeom_topo::SurfaceId,
+    uses: &[Shape],
+    tol: Tolerances,
+) -> OgeomResult<()> {
+    use ogeom_geom::{Curve2d as _, Surface as _};
+    const ALONG: usize = 16;
+    let Some(geometry) = model.geometry().surface(surface).cloned() else {
+        return Ok(());
+    };
+    if !geometry.is_periodic_u() || uses.len() < 2 {
+        return Ok(());
+    }
+    let ((u0, u1), _) = geometry.domain();
+    let period = u1 - u0;
+    let close = period * 1e-6;
+    // Each use's chart points, in the way it is walked.
+    let mut walks: Vec<Vec<ogeom_math::Point2>> = Vec::with_capacity(uses.len());
+    for e in uses {
+        let Some((curve, range)) = one_pcurve(model, e, surface) else {
+            return Ok(());
+        };
+        let Some(pcurve) = model.geometry().pcurve(curve) else {
+            return Ok(());
+        };
+        let mut walk = Vec::with_capacity(ALONG + 1);
+        for k in 0..=ALONG {
+            #[expect(clippy::cast_precision_loss, reason = "a few points")]
+            let s = k as f64 / ALONG as f64;
+            walk.push(pcurve.point_at(range.0 + (range.1 - range.0) * s, tol)?);
+        }
+        if e.orientation() == Orientation::Reversed {
+            walk.reverse();
+        }
+        walks.push(walk);
+    }
+    // How far apart in space two uses' ends may stand and meet: as far as
+    // the two edges and the vertex between them are known to.
+    let mut reaches = Vec::with_capacity(uses.len());
+    for (i, e) in uses.iter().enumerate() {
+        let next = &uses[(i + 1) % uses.len()];
+        let mut reach = tol.confusion();
+        let vertex = ogeom_algo::edge_vertices(model, e)?.map(|(_, v)| v);
+        for shape in [Some(e), Some(next), vertex.as_ref()].into_iter().flatten() {
+            if let Some(t) = model.tolerance_of(shape)? {
+                reach = reach.max(t.get());
+            }
+        }
+        reaches.push(reach);
+    }
+    // Whether the chart's straight run from `from` to `to` stays at one
+    // point in space, within `reach`: a pole's row.
+    let collapses = |from: ogeom_math::Point2,
+                     to: ogeom_math::Point2,
+                     reach: f64|
+     -> OgeomResult<bool> {
+        let at = geometry.point_at(from.x, from.y, tol)?;
+        for k in 1..=4 {
+            let s = f64::from(k) / 4.0;
+            let p = geometry.point_at(
+                from.x + (to.x - from.x) * s,
+                from.y + (to.y - from.y) * s,
+                tol,
+            )?;
+            if p.distance(at) > 2.0 * reach {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    // Each use's turns along `u`, chained from the first, and the uses a
+    // pole stands before.
+    let n = walks.len();
+    let mut shifts = vec![0.0; n];
+    let mut poles = Vec::new();
+    for j in 0..n {
+        let i = (j + n - 1) % n;
+        let from = walks[i][ALONG] + ogeom_math::Vector2::new(shifts[i], 0.0);
+        let to = walks[j][0] + ogeom_math::Vector2::new(shifts[j], 0.0);
+        if from.distance(to) <= close {
+            continue;
+        }
+        let reach = reaches[i];
+        if geometry
+            .point_at(from.x, from.y, tol)?
+            .distance(geometry.point_at(to.x, to.y, tol)?)
+            > 2.0 * reach
+        {
+            return Ok(());
+        }
+        if collapses(from, to, reach)? {
+            poles.push(j);
+            continue;
+        }
+        let turns = ((from.x - to.x) / period).round() * period;
+        if j == 0 || (to.y - from.y).abs() > close || (to.x + turns - from.x).abs() > close {
+            // The ring closes a turn off itself, or breaks off a pole by
+            // other than whole turns.
+            return Ok(());
+        }
+        shifts[j] += turns;
+        for later in shifts.iter_mut().skip(j + 1) {
+            *later += turns;
+        }
+    }
+    let [a, b] = poles[..] else {
+        return Ok(());
+    };
+    // Twice the area the ring encloses, its chain from `a` to `b` carried
+    // `turn` periods further along `u`.
+    let carried = |k: usize| if a < b { k >= a && k < b } else { k >= a || k < b };
+    let area = |turn: f64| {
+        let mut points = Vec::new();
+        for (k, walk) in walks.iter().enumerate() {
+            let shift = shifts[k] + if carried(k) { turn * period } else { 0.0 };
+            points.extend(walk.iter().map(|p| (p.x + shift, p.y)));
+        }
+        let mut twice = 0.0;
+        for k in 0..points.len() {
+            let (p, q) = (points[k], points[(k + 1) % points.len()]);
+            twice += p.0 * q.1 - q.0 * p.1;
+        }
+        twice
+    };
+    let turn = if area(0.0) >= 0.0 {
+        0.0
+    } else if let Some(turn) = [1.0, -1.0].into_iter().find(|t| area(*t) > 0.0) {
+        turn
+    } else {
+        return Ok(());
+    };
+    for (k, e) in uses.iter().enumerate() {
+        let shift = shifts[k] + if carried(k) { turn * period } else { 0.0 };
+        shift_pcurve(model, e, surface, ogeom_math::Vector2::new(shift, 0.0), tol)?;
     }
     Ok(())
 }
@@ -838,6 +1001,39 @@ mod tests {
             .shape;
         let bossed = ogeom_bool::fuse(&mut m, &block, &boss, T).unwrap().shape;
         round_trips(&mut m, &bossed);
+    }
+
+    /// A ball's half cut off by a plane through its poles, the seam one
+    /// of its two meridians (`y <= 0` about `z`): built back, its sphere's
+    /// face holds the half it bounds, not the other, whichever copy of
+    /// the seam its meridian's pcurve lands in: valid, and half the ball.
+    #[test]
+    fn a_half_ball_cut_through_its_poles_builds_back_whole() {
+        let mut m = Model::new();
+        let ball = ogeom_algo::make_sphere(&mut m, Frame::WORLD, 2.0, T)
+            .unwrap()
+            .shape;
+        let corner = Frame::new(
+            Point::new(-3.0, -3.0, -3.0),
+            Direction::new(Vector::new(0.0, 0.0, 1.0), T).unwrap(),
+            Direction::new(Vector::new(1.0, 0.0, 0.0), T).unwrap(),
+            T,
+        )
+        .unwrap();
+        let block = ogeom_algo::make_box(&mut m, corner, (6.0, 3.0, 6.0), T)
+            .unwrap()
+            .shape;
+        let half = ogeom_bool::common(&mut m, &ball, &block, T).unwrap().shape;
+        let whole = 2.0 / 3.0 * core::f64::consts::PI * 8.0;
+        assert!((volume(&m, &half) - whole).abs() < 1e-4, "{}", volume(&m, &half));
+        // The poles' degenerate edges are left out of the read and put
+        // back by the build: no image to trace, so the solid is judged
+        // whole rather than edge for edge.
+        let built = super::rebuilt(&mut m, &half, T).unwrap().unwrap();
+        let found = ogeom_algo::check(&m, &built.shape, T).unwrap();
+        assert!(found.is_valid(), "{:?}", found.problems);
+        let after = volume(&m, &built.shape);
+        assert!((after - whole).abs() < 1e-4, "{after} against {whole}");
     }
 
     /// A 10 cube with its top front edge rounded at 2, built from a sheet:
