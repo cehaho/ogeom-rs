@@ -1505,6 +1505,89 @@ impl<'a> Reader<'a> {
         crate::inversion::parameter_on(curve, p)
     }
 
+    /// The window of an edge closing on its one vertex at `at` over
+    /// `curve`, which does not close: the parameters its file pcurves all
+    /// cover (the edge stands on each surface only there), where that is
+    /// a window inside the curve's domain, short of it, and the curve
+    /// stands at the vertex at both its ends. A pcurve of a `SURFACE_CURVE`
+    /// runs on the curve's own parameter. A warning says so.
+    ///
+    /// # Errors
+    ///
+    /// As evaluating the curve.
+    fn sliver_window(
+        &mut self,
+        edge_id: u64,
+        curve: &Curve,
+        at: Point,
+    ) -> OgeomResult<Option<(f64, f64)>> {
+        let (lo, hi) = curve.domain();
+        let near = self.tol.confusion() * 10.0;
+        if curve.point_at(lo, self.tol)?.distance(curve.point_at(hi, self.tol)?) <= near {
+            return Ok(None);
+        }
+        let Ok(args) = self.args(edge_id, "EDGE_CURVE") else {
+            return Ok(None);
+        };
+        let Ok(instance) = self.instance(ref_at(args, 3)) else {
+            return Ok(None);
+        };
+        let Some(dressed) = instance.part("SURFACE_CURVE") else {
+            return Ok(None);
+        };
+        let uses: Vec<u64> = dressed
+            .get(2)
+            .and_then(Arg::list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Arg::reference)
+            .collect();
+        let mut window: Option<(f64, f64)> = None;
+        for id in uses {
+            let Ok(pargs) = self.args(id, "PCURVE") else {
+                return Ok(None);
+            };
+            let Ok(dargs) = self.args(ref_at(pargs, 2), "DEFINITIONAL_REPRESENTATION") else {
+                return Ok(None);
+            };
+            let Some(item) = dargs
+                .get(1)
+                .and_then(Arg::list)
+                .and_then(|items| items.first())
+                .and_then(Arg::reference)
+            else {
+                return Ok(None);
+            };
+            let Ok(Some(pcurve)) = self.nested(|reader| reader.planar_curve(item)) else {
+                return Ok(None);
+            };
+            let (a, b) = pcurve.domain();
+            window = Some(window.map_or((a, b), |(wa, wb)| (wa.max(a), wb.min(b))));
+        }
+        let Some((a, b)) = window else {
+            return Ok(None);
+        };
+        let slack = self.tol.parametric().max((hi - lo) * 1e-9);
+        if a < lo - slack || b > hi + slack || b <= a || (a - lo <= slack && hi - b <= slack) {
+            return Ok(None);
+        }
+        let (a, b) = (a.max(lo), b.min(hi));
+        let reach = self.tol.confusion() * 1e4;
+        let (miss_a, miss_b) = (
+            curve.point_at(a, self.tol)?.distance(at),
+            curve.point_at(b, self.tol)?.distance(at),
+        );
+        if miss_a > reach || miss_b > reach {
+            return Ok(None);
+        }
+        self.report.warnings.push(format!(
+            "#{edge_id}: an edge closing on one vertex over an open curve; the window \
+             its pcurves state was taken, its ends {miss_a:.2e} and {miss_b:.2e} from the vertex"
+        ));
+        self.tally("sliver-window", miss_a.max(miss_b), edge_id);
+        Ok(Some((a, b)))
+    }
+
     /// The pcurves the file states for edge `edge_id` on surface entity
     /// `surface_id`: the `PCURVE`s of its `SURFACE_CURVE` or `SEAM_CURVE`
     /// drawn on that surface, as written. Nothing where the file states
@@ -2024,107 +2107,119 @@ impl<'a> Reader<'a> {
         } else {
             (p2, p1, true)
         };
-        let (range, closed) = match (
-            self.parameter_of(&curve, start),
-            self.parameter_of(&curve, end),
-        ) {
-            (Some(a), Some(b)) => {
-                let period = if curve.is_periodic() {
-                    let (lo, hi) = curve.domain();
-                    hi - lo
-                } else {
-                    0.0
-                };
-                if v1 == v2 {
-                    ((a, a + if period > 0.0 { period } else { 0.0 }), true)
-                } else if period > 0.0 && b <= a + self.tol.parametric() {
-                    ((a, b + period), false)
-                } else if b < a - self.tol.parametric() {
-                    // The vertices stand at descending parameters on an
-                    // open curve whatever the sense flag says: a
-                    // mesh-to-STEP converter writes every edge forward and
-                    // lets the line run the other way. The edge is built
-                    // along the curve's own parameter and runs against it.
-                    flipped = !flipped;
-                    self.report.warnings.push(format!(
-                        "#{id}: the edge's vertices run against its curve's \
-                         parameter despite its sense flag; the edge was reversed"
-                    ));
-                    self.tally("edge-against-curve", a - b, id);
-                    ((b, a), false)
-                } else {
-                    ((a, b), false)
+        // An edge closing on one vertex over a curve that does not close (a
+        // sliver shorter than its vertex's tolerance, its two ends merged
+        // into one) runs the window its pcurves state, not the whole curve.
+        let sliver = if v1 == v2 {
+            self.sliver_window(id, &curve, start)?
+        } else {
+            None
+        };
+        let (range, closed) = if let Some(window) = sliver {
+            (window, false)
+        } else {
+            match (
+                self.parameter_of(&curve, start),
+                self.parameter_of(&curve, end),
+            ) {
+                (Some(a), Some(b)) => {
+                    let period = if curve.is_periodic() {
+                        let (lo, hi) = curve.domain();
+                        hi - lo
+                    } else {
+                        0.0
+                    };
+                    if v1 == v2 {
+                        ((a, a + if period > 0.0 { period } else { 0.0 }), true)
+                    } else if period > 0.0 && b <= a + self.tol.parametric() {
+                        ((a, b + period), false)
+                    } else if b < a - self.tol.parametric() {
+                        // The vertices stand at descending parameters on an
+                        // open curve whatever the sense flag says: a
+                        // mesh-to-STEP converter writes every edge forward and
+                        // lets the line run the other way. The edge is built
+                        // along the curve's own parameter and runs against it.
+                        flipped = !flipped;
+                        self.report.warnings.push(format!(
+                            "#{id}: the edge's vertices run against its curve's \
+                             parameter despite its sense flag; the edge was reversed"
+                        ));
+                        self.tally("edge-against-curve", a - b, id);
+                        ((b, a), false)
+                    } else {
+                        ((a, b), false)
+                    }
                 }
-            }
-            _ => {
-                // No closed-form inversion: take the curve's own domain and
-                // hold the endpoints to it.
-                //
-                // A closed edge whose one vertex sits on the curve but away
-                // from its seam (a fitted loop written with its start
-                // wherever the fit began, the vertex millimetres along it)
-                // would otherwise be held to a seam the vertex misses by
-                // that much, and the vertex's tolerance widened to say so.
-                // The seam is moved to the vertex instead: the same curve,
-                // begun where the edge does.
-                if v1 == v2
-                    && let Curve::BSpline(spline) = &curve
-                {
-                    let (lo, hi) = curve.domain();
-                    let gap = curve.point_at(lo, self.tol)?.distance(start);
-                    if gap > self.tol.confusion() * 10.0 {
-                        let samples = (spline.control_points().len() * 8).max(64);
-                        if let Ok(found) = project_on_curve(&curve, start, samples, self.tol)
-                            && found.distance <= self.tol.confusion() * 1e4
-                            && found.parameter > lo + self.tol.parametric()
-                            && found.parameter < hi - self.tol.parametric()
-                            && let Ok(moved) = spline.reseamed_at(found.parameter, self.tol)
-                        {
-                            curve = Curve::BSpline(moved);
-                            self.report.warnings.push(format!(
-                                "#{id}: a closed edge's vertex sits {gap:.2e} along its \
-                                 curve from the seam; the seam was moved to the vertex"
-                            ));
-                            self.tally("reseamed", gap, id);
+                _ => {
+                    // No closed-form inversion: take the curve's own domain and
+                    // hold the endpoints to it.
+                    //
+                    // A closed edge whose one vertex sits on the curve but away
+                    // from its seam (a fitted loop written with its start
+                    // wherever the fit began, the vertex millimetres along it)
+                    // would otherwise be held to a seam the vertex misses by
+                    // that much, and the vertex's tolerance widened to say so.
+                    // The seam is moved to the vertex instead: the same curve,
+                    // begun where the edge does.
+                    if v1 == v2
+                        && let Curve::BSpline(spline) = &curve
+                    {
+                        let (lo, hi) = curve.domain();
+                        let gap = curve.point_at(lo, self.tol)?.distance(start);
+                        if gap > self.tol.confusion() * 10.0 {
+                            let samples = (spline.control_points().len() * 8).max(64);
+                            if let Ok(found) = project_on_curve(&curve, start, samples, self.tol)
+                                && found.distance <= self.tol.confusion() * 1e4
+                                && found.parameter > lo + self.tol.parametric()
+                                && found.parameter < hi - self.tol.parametric()
+                                && let Ok(moved) = spline.reseamed_at(found.parameter, self.tol)
+                            {
+                                curve = Curve::BSpline(moved);
+                                self.report.warnings.push(format!(
+                                    "#{id}: a closed edge's vertex sits {gap:.2e} along its \
+                                     curve from the seam; the seam was moved to the vertex"
+                                ));
+                                self.tally("reseamed", gap, id);
+                            }
                         }
                     }
-                }
-                let (lo, hi) = curve.domain();
-                let head = curve.point_at(lo, self.tol)?;
-                let tail = curve.point_at(hi, self.tol)?;
-                let (head_miss, tail_miss) = (head.distance(start), tail.distance(end));
-                if head_miss > self.tol.confusion() * 10.0
-                    || tail_miss > self.tol.confusion() * 10.0
-                {
-                    // An open edge whose vertices stand *on* the curve but
-                    // short of its ends (a file that writes the whole
-                    // spline and lets the vertices say where the edge
-                    // stops, millimetres in) takes the window between the
-                    // vertices' own feet. Held to the whole curve, the edge
-                    // overshoots its neighbours and the face it bounds draws
-                    // as nothing at all.
-                    let window = if v1 == v2 {
-                        None
+                    let (lo, hi) = curve.domain();
+                    let head = curve.point_at(lo, self.tol)?;
+                    let tail = curve.point_at(hi, self.tol)?;
+                    let (head_miss, tail_miss) = (head.distance(start), tail.distance(end));
+                    if head_miss > self.tol.confusion() * 10.0
+                        || tail_miss > self.tol.confusion() * 10.0
+                    {
+                        // An open edge whose vertices stand *on* the curve but
+                        // short of its ends (a file that writes the whole
+                        // spline and lets the vertices say where the edge
+                        // stops, millimetres in) takes the window between the
+                        // vertices' own feet. Held to the whole curve, the edge
+                        // overshoots its neighbours and the face it bounds draws
+                        // as nothing at all.
+                        let window = if v1 == v2 {
+                            None
+                        } else {
+                            window_between_feet(&curve, start, end, self.tol)
+                        };
+                        if let Some(window) = window {
+                            self.report.warnings.push(format!(
+                                "#{id}: edge endpoints sit {head_miss:.2e} and {tail_miss:.2e} \
+                                 from its curve's ends; the window between the vertices' \
+                                 feet on the curve was taken"
+                            ));
+                            self.tally("vertex-window", head_miss.max(tail_miss), id);
+                            (window, false)
+                        } else {
+                            self.report.warnings.push(format!(
+                                "#{id}: edge endpoints sit {head_miss:.2e} and {tail_miss:.2e} \
+                                 from its curve's ends; the curve's own domain was taken"
+                            ));
+                            ((lo, hi), v1 == v2)
+                        }
                     } else {
-                        window_between_feet(&curve, start, end, self.tol)
-                    };
-                    if let Some(window) = window {
-                        self.report.warnings.push(format!(
-                            "#{id}: edge endpoints sit {head_miss:.2e} and {tail_miss:.2e} \
-                             from its curve's ends; the window between the vertices' \
-                             feet on the curve was taken"
-                        ));
-                        self.tally("vertex-window", head_miss.max(tail_miss), id);
-                        (window, false)
-                    } else {
-                        self.report.warnings.push(format!(
-                            "#{id}: edge endpoints sit {head_miss:.2e} and {tail_miss:.2e} \
-                             from its curve's ends; the curve's own domain was taken"
-                        ));
                         ((lo, hi), v1 == v2)
                     }
-                } else {
-                    ((lo, hi), v1 == v2)
                 }
             }
         };
@@ -5474,13 +5569,17 @@ fn derive_pcurve(
     // the gap is only asked whether it passes the confusion distance, and
     // by how much where it does; with the file's own to weigh it against,
     // it is the bound they are held to.
-    let lifted = |pcurve: &PlanarCurve| {
+    // A pcurve derived in closed form is the curve's own foot on the
+    // surface at each parameter: read at the same parameter, its gap is how
+    // far the curve stands from the surface, which the part of it square
+    // to the curve understates where the curve leaves the surface aslant.
+    let lifted = |pcurve: &PlanarCurve, paced: bool| {
         let gap = if stated.is_empty() {
             ogeom_algo::pcurve_fit::lifted_gap_past_confusion
         } else {
             ogeom_algo::pcurve_fit::lifted_gap
         };
-        gap((curve, range), (pcurve, range), surface, false, tol).unwrap_or(0.0)
+        gap((curve, range), (pcurve, range), surface, paced, tol).unwrap_or(0.0)
     };
     let nearest = nearest_stated(curve, range, surface, stated, tol);
     // One that follows the curve exactly needs nothing derived beside it.
@@ -5495,7 +5594,7 @@ fn derive_pcurve(
     let derived =
         if let Some(exact) = ogeom_intersect::exact_pcurve_over(curve, range, surface, tol) {
             let exact = crate::pcurves::over_range(&exact, range);
-            let off = lifted(&exact);
+            let off = lifted(&exact, true);
             PreparedPcurve::Exact { curve: exact, off }
         } else {
             // No closed form: a spline surface, or a combination the
@@ -5503,7 +5602,7 @@ fn derive_pcurve(
             // parameters, so same-parameter is preserved by construction.
             match crate::pcurves::fit_projected_pcurve(curve, range, surface, tol) {
                 Ok((fitted, error, met, worst_off, warning)) => {
-                    let off = lifted(&fitted);
+                    let off = lifted(&fitted, false);
                     PreparedPcurve::Fitted {
                         curve: fitted,
                         error,
@@ -5530,10 +5629,15 @@ fn derive_pcurve(
         return derived;
     };
     let bound = 2.0f64.mul_add(allowed, tol.confusion());
+    // Kept, the file's pcurve still bounds an edge standing `allowed` from
+    // the surface, which its tolerance covers too.
     if let Some((curve, off)) = nearest
         && off <= bound
     {
-        return PreparedPcurve::Stated { curve, off };
+        return PreparedPcurve::Stated {
+            curve,
+            off: off.max(allowed),
+        };
     }
     // The file may state the boundary at another pace or phase than its
     // curve's: a conic its frame runs the other way round, a line or a
@@ -5556,7 +5660,10 @@ fn derive_pcurve(
         if let Some((curve, off)) = nearest_stated(curve, range, surface, &repaced, tol)
             && off <= bound
         {
-            return PreparedPcurve::Stated { curve, off };
+            return PreparedPcurve::Stated {
+                curve,
+                off: off.max(allowed),
+            };
         }
     }
     derived
