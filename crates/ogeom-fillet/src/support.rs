@@ -1904,6 +1904,22 @@ pub(crate) fn ball_fits_within(
                 {
                     continue;
                 }
+                // Past a side along which the face across meets this one
+                // tangent (a smooth seam, where the face narrows to a corner
+                // between the crease and the seam), the ball does not hang
+                // over nothing: it touches that face. The band would have to
+                // hand its support over to it at the seam, a transition the
+                // march does not make; that is the refusal's true cause.
+                if let Some(across) = tangent_seam_across(model, solid, face, guess, tol)? {
+                    ogeom_bail!(
+                        Construction,
+                        "a concave blend of radius {radius} on the edge through {p:?} sets \
+                         back {setback} across a face that does not reach so far: its \
+                         contact crosses a tangent seam onto the face beyond, at {across:?}, \
+                         and a marched band does not carry its support across a tangent \
+                         seam; see docs/CAPABILITIES.md, fillet.edge-blends"
+                    );
+                }
                 ogeom_bail!(
                     Construction,
                     "a concave blend of radius {radius} on the edge through {p:?} sets \
@@ -1983,6 +1999,93 @@ pub(crate) fn ball_fits_within(
         ogeom_bail!(Construction, "{refusal}");
     }
     Ok(contacts)
+}
+
+/// Where a contact run off `face` at `guess` lands on a face of `solid`
+/// across one of `face`'s sides along which the two meet tangent (a smooth
+/// seam): `guess` projected onto that face's surface, where the projection
+/// lies within its trim. `None` where no face across a tangent side holds
+/// it.
+///
+/// Tangent is read at the side's quarter points: the outward normals of
+/// the two faces within [`crate::TANGENT_CHAIN_ANGLE`] of each other.
+///
+/// # Errors
+///
+/// As reading the faces and projecting onto them.
+fn tangent_seam_across(
+    model: &Model,
+    solid: &Shape,
+    face: &Shape,
+    guess: Point,
+    tol: Tolerances,
+) -> OgeomResult<Option<Point>> {
+    use ogeom_geom::Surface as _;
+    use ogeom_geom::Transformable as _;
+    let placed = |f: &Shape| -> OgeomResult<Option<SurfaceGeometry>> {
+        let Some(NodeData::Face(data)) = model.node(f).map(|n| n.data()) else {
+            return Ok(None);
+        };
+        let Some(surface) = model.geometry().surface(data.surface) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            surface
+                .clone()
+                .transformed(&f.transform(model.datums())?, tol)?,
+        ))
+    };
+    let outward = |f: &Shape, surface: &SurfaceGeometry, p: Point| -> OgeomResult<Option<Vector>> {
+        let (u, v) = ogeom_algo::project_on_surface(surface, p, 16, tol)?.parameters;
+        let Ok(n) = surface.normal_at(u, v, tol) else {
+            return Ok(None);
+        };
+        Ok(Some(if f.orientation() == Orientation::Reversed {
+            -n.vector()
+        } else {
+            n.vector()
+        }))
+    };
+    let Some(own) = placed(face)? else {
+        return Ok(None);
+    };
+    let square = crate::TANGENT_CHAIN_ANGLE.cos();
+    for side in ogeom_topo::explore_unique(model, face, ShapeType::Edge)? {
+        let Ok((curve, (a, b))) = edge_curve(model, &side, tol) else {
+            continue;
+        };
+        for other in ogeom_topo::ancestors_of(model, solid, &side, ShapeType::Face)? {
+            if other.is_same(face) {
+                continue;
+            }
+            let Some(across) = placed(&other)? else {
+                continue;
+            };
+            let mut tangent = true;
+            for f in [0.25, 0.5, 0.75] {
+                let p = curve.point_at(a + (b - a) * f, tol)?;
+                match (outward(face, &own, p)?, outward(&other, &across, p)?) {
+                    (Some(n0), Some(n1)) if n0.dot(n1) >= square => {}
+                    _ => {
+                        tangent = false;
+                        break;
+                    }
+                }
+            }
+            if !tangent {
+                continue;
+            }
+            let found = ogeom_algo::project_on_surface(&across, guess, 16, tol)?;
+            let (u, v) = found.parameters;
+            if clamped_short(&across, (u, v), guess, found.point, tol)? {
+                continue;
+            }
+            if chart_holds(model, &other, ogeom_math::Point2::new(u, v), tol)? {
+                return Ok(Some(found.point));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// A station of a band whose contact on a face runs off it: the edge's

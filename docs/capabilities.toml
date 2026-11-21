@@ -1059,7 +1059,11 @@ ends still on the cap. A convex straight shelf edge beside a concave \
 circular cylinder rim can carry the ball onto that rim, returning to the \
 cap at both ends. Both transfers check actual contact trim, intervening \
 faces and other bands, and fit the rolling envelope within twenty \
-confusions. Other support changes retain their named refusals. \
+confusions. Other support changes retain their named refusals; one \
+is a concave band on a curved edge whose contact crosses a tangent seam \
+onto the face beyond (a drum narrowing to a corner between the crease \
+and the seam where it meets a plane or a patch tangent): the march does \
+not hand its support over at the seam, and the refusal names that seam. \
 Where the request also rounds the \
 plate's top edge along that side, one tangent chain through the tangent \
 point, the edge's convex round turns into the foot's concave one through \
@@ -1457,6 +1461,7 @@ tests = [
     "crates/ogeom-fillet/tests/cap_history.rs",
     "crates/ogeom-fillet/tests/corner_history.rs",
     "crates/ogeom-fillet/tests/rolling_curved.rs",
+    "crates/ogeom-fillet/tests/tangent_seam.rs",
     "crates/ogeom-fillet/tests/switch_over.rs",
     "crates/ogeom-fillet/tests/switch_over.rs::a_half_frustum_s_foot_rounds_through_its_pipe_corners",
     "crates/ogeom-fillet/tests/switch_over.rs::a_half_frustum_s_top_loop_rounds_through_its_pipe_corners",
