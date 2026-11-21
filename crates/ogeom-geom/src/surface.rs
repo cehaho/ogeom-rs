@@ -549,6 +549,262 @@ impl BSplineSurface {
     pub const fn is_rational(&self) -> bool {
         self.rational
     }
+
+    /// The control net as its runs along `v`: one per `u` index.
+    fn v_runs(&self) -> Vec<Vec<Weighted<Point>>> {
+        let nv = self.grid.v_count();
+        self.grid.points().chunks(nv).map(<[_]>::to_vec).collect()
+    }
+
+    /// The control net as its runs along `u`: one per `v` index.
+    fn u_runs(&self) -> Vec<Vec<Weighted<Point>>> {
+        let (nu, nv) = (self.grid.u_count(), self.grid.v_count());
+        (0..nv)
+            .map(|j| (0..nu).map(|i| self.grid.points()[i * nv + j]).collect())
+            .collect()
+    }
+
+    /// A patch from its runs along `v`, one per `u` index.
+    fn from_v_runs(
+        u_knots: KnotVector,
+        v_knots: KnotVector,
+        runs: &[Vec<Weighted<Point>>],
+    ) -> OgeomResult<Self> {
+        let (nu, nv) = (runs.len(), runs.first().map_or(0, Vec::len));
+        let net: Vec<Weighted<Point>> = runs.iter().flatten().copied().collect();
+        Self::rational(u_knots, v_knots, ControlGrid::new(net, nu, nv)?)
+    }
+
+    /// A patch from its runs along `u`, one per `v` index.
+    fn from_u_runs(
+        u_knots: KnotVector,
+        v_knots: KnotVector,
+        runs: &[Vec<Weighted<Point>>],
+    ) -> OgeomResult<Self> {
+        let (nv, nu) = (runs.len(), runs.first().map_or(0, Vec::len));
+        let net: Vec<Weighted<Point>> = (0..nu)
+            .flat_map(|i| runs.iter().map(move |r| r[i]))
+            .collect();
+        Self::rational(u_knots, v_knots, ControlGrid::new(net, nu, nv)?)
+    }
+
+    /// This patch with `v` running the other way over the same domain: the
+    /// same surface, its normal turned over.
+    ///
+    /// # Errors
+    ///
+    /// As [`BSplineSurface::rational`], which the net always satisfies.
+    pub fn reversed_v(&self) -> OgeomResult<Self> {
+        let runs: Vec<Vec<Weighted<Point>>> = self
+            .v_runs()
+            .into_iter()
+            .map(|mut run| {
+                run.reverse();
+                run
+            })
+            .collect();
+        Self::from_v_runs(self.u_knots.clone(), self.v_knots.reversed(), &runs)
+    }
+
+    /// This patch with its `v` domain mapped linearly onto `[start, end]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`KnotVector::reparameterized`].
+    pub fn reparameterized_v(&self, start: f64, end: f64) -> OgeomResult<Self> {
+        Self::rational(
+            self.u_knots.clone(),
+            self.v_knots.reparameterized(start, end)?,
+            self.grid.clone(),
+        )
+    }
+
+    /// This patch and `other` joined along `v` into one: `other`'s first
+    /// row of the net (its side at the start of `v`) laid on this patch's
+    /// last (its side at the end of `v`), the two sides being one curve
+    /// with one `u` parameter. Two patches meeting tangent along an
+    /// iso-line both share (a tube and the patch continuing it smoothly)
+    /// become one surface whose `v` crosses that line, where the join knot
+    /// keeps the multiplicity of the `v` degree: the surface passes through
+    /// the shared side as both did, with each patch's own continuity on
+    /// either side of it.
+    ///
+    /// Both patches are first brought to one degree in each direction and
+    /// to the union of their `u` knots, every step exact; a direction whose
+    /// end knots stand outside its domain with the domain's end at full
+    /// multiplicity less one (a single span written periodically) reads the
+    /// same clamped. `other`'s net keeps its weights and this patch's are
+    /// scaled by the one factor that makes the shared row's weights agree,
+    /// which leaves the surface as it is. The result's `v` runs over this
+    /// patch's domain, then `other`'s, shifted to begin where this patch's
+    /// ends; `u` keeps this patch's parameters.
+    ///
+    /// # Errors
+    ///
+    /// [`OgeomError::Construction`](ogeom_core::OgeomError::Construction)
+    /// where the `u` domains differ, a direction's knots cannot be read
+    /// clamped, or the two sides are not one curve: their control points
+    /// apart by more than the confusion distance, or their weights not in
+    /// one ratio.
+    pub fn joined_v(&self, other: &Self, tol: Tolerances) -> OgeomResult<Self> {
+        let (mut a, mut b) = (self.clamped()?, other.clamped()?);
+        let (ua, ub) = (a.u_knots.domain(), b.u_knots.domain());
+        let near = (ua.1 - ua.0) * 1e-12;
+        if (ua.0 - ub.0).abs() > near || (ua.1 - ub.1).abs() > near {
+            ogeom_bail!(
+                Construction,
+                "patches over u {ua:?} and {ub:?} have no common side to join along"
+            );
+        }
+        // One degree each way.
+        let raise = |patch: &Self, along_u: bool, to: usize| -> OgeomResult<Self> {
+            let mut out = patch.clone();
+            while (if along_u { &out.u_knots } else { &out.v_knots }).degree() < to {
+                let (knots, runs) = if along_u {
+                    (&out.u_knots, out.u_runs())
+                } else {
+                    (&out.v_knots, out.v_runs())
+                };
+                let mut raised_knots = None;
+                let mut raised = Vec::with_capacity(runs.len());
+                for run in &runs {
+                    let (k, c) = bspline::elevate_degree(knots, run, tol)?;
+                    raised_knots = Some(k);
+                    raised.push(c);
+                }
+                let Some(k) = raised_knots else {
+                    ogeom_bail!(Construction, "a patch with no control net cannot be raised");
+                };
+                out = if along_u {
+                    Self::from_u_runs(k, out.v_knots.clone(), &raised)?
+                } else {
+                    Self::from_v_runs(out.u_knots.clone(), k, &raised)?
+                };
+            }
+            Ok(out)
+        };
+        let pu = a.u_knots.degree().max(b.u_knots.degree());
+        let pv = a.v_knots.degree().max(b.v_knots.degree());
+        a = raise(&raise(&a, true, pu)?, false, pv)?;
+        b = raise(&raise(&b, true, pu)?, false, pv)?;
+        // One set of `u` knots: each patch takes what the other has more of.
+        let refine = |patch: &Self, target: &KnotVector| -> OgeomResult<Self> {
+            let mut knots = patch.u_knots.clone();
+            let mut runs = patch.u_runs();
+            for (value, wanted) in target.distinct() {
+                let have = knots
+                    .distinct()
+                    .iter()
+                    .find(|(k, _)| (k - value).abs() <= near)
+                    .map_or(0, |(_, m)| *m);
+                if wanted <= have {
+                    continue;
+                }
+                let mut inserted = None;
+                for run in &mut runs {
+                    let (k, c) = bspline::insert_knot(&knots, run, value, wanted - have, tol)?;
+                    *run = c;
+                    inserted = Some(k);
+                }
+                if let Some(k) = inserted {
+                    knots = k;
+                }
+            }
+            Self::from_u_runs(knots, patch.v_knots.clone(), &runs)
+        };
+        let a_knots = a.u_knots.clone();
+        a = refine(&a, &b.u_knots)?;
+        b = refine(&b, &a_knots)?;
+        let same_knots = a.u_knots.knots().len() == b.u_knots.knots().len()
+            && a.u_knots
+                .knots()
+                .iter()
+                .zip(b.u_knots.knots())
+                .all(|(x, y)| (x - y).abs() <= near);
+        if !same_knots {
+            ogeom_bail!(
+                Construction,
+                "the two patches' u knots do not refine to one vector"
+            );
+        }
+        // The shared side: this patch's last row against `other`'s first.
+        let (a_runs, b_runs) = (a.v_runs(), b.v_runs());
+        let mut ratios = Vec::with_capacity(a_runs.len());
+        for (ra, rb) in a_runs.iter().zip(&b_runs) {
+            let (Some(last), Some(first)) = (ra.last(), rb.first()) else {
+                ogeom_bail!(Construction, "a patch with an empty net cannot be joined");
+            };
+            if !last.point().is_equal(first.point(), tol) {
+                ogeom_bail!(
+                    Construction,
+                    "the patches' sides are not one curve: control points {:?} and {:?} apart",
+                    last.point(),
+                    first.point()
+                );
+            }
+            ratios.push(first.weight / last.weight);
+        }
+        let k = ratios[0];
+        if ratios.iter().any(|r| (r - k).abs() > 1e-9 * k.abs()) {
+            ogeom_bail!(
+                Construction,
+                "the patches' sides are not one curve: their weights are in no one ratio"
+            );
+        }
+        let mut joined_knots = None;
+        let mut joined = Vec::with_capacity(a_runs.len());
+        for (ra, rb) in a_runs.iter().zip(&b_runs) {
+            let scaled: Vec<Weighted<Point>> = ra
+                .iter()
+                .map(|w| Weighted {
+                    scaled: Point::from_vector(w.scaled.to_vector() * k),
+                    weight: w.weight * k,
+                })
+                .collect();
+            let mut rest = rb.clone();
+            if let (Some(shared), Some(start)) = (scaled.last(), rest.first_mut()) {
+                *start = *shared;
+            }
+            let (knots, run) =
+                bspline::join(&(a.v_knots.clone(), scaled), &(b.v_knots.clone(), rest))?;
+            joined_knots = Some(knots);
+            joined.push(run);
+        }
+        let Some(v_knots) = joined_knots else {
+            ogeom_bail!(Construction, "a patch with no control net cannot be joined");
+        };
+        Self::from_v_runs(a.u_knots.clone(), v_knots, &joined)
+    }
+
+    /// This patch with each direction's knots read clamped: a single
+    /// outside knot beyond a domain end held at full multiplicity less one
+    /// does not enter the basis over the domain, and is laid on that end.
+    fn clamped(&self) -> OgeomResult<Self> {
+        let clamp = |knots: &KnotVector| -> OgeomResult<KnotVector> {
+            if knots.is_clamped() {
+                return Ok(knots.clone());
+            }
+            let p = knots.degree();
+            let mut k = knots.knots().to_vec();
+            let n = k.len();
+            let (lo, hi) = knots.domain();
+            // The basis over the domain's first span reads k[1..=2p]; with
+            // k[1..=p] all at the start, k[0] drops out of it, and so does
+            // k[n - 1] at the end.
+            let start_held = k[1..=p].iter().all(|x| *x == lo);
+            let end_held = k[n - 1 - p..n - 1].iter().all(|x| *x == hi);
+            if !(start_held && end_held) {
+                ogeom_bail!(
+                    Construction,
+                    "a knot vector whose ends stand open is not read clamped"
+                );
+            }
+            k[0] = lo;
+            k[n - 1] = hi;
+            KnotVector::new(k, p)
+        };
+        Self::rational(clamp(&self.u_knots)?, clamp(&self.v_knots)?, self.grid.clone())
+    }
 }
 
 impl RevolutionSurface {
@@ -2706,5 +2962,79 @@ mod tests {
         let s = SphereSurface::new(Sphere::new(Frame::WORLD, 1.0, T).unwrap());
         assert!(!s.is_periodic_v());
         assert!(s.point_at(0.0, core::f64::consts::PI, T).is_err());
+    }
+
+    /// Two pieces of one rational patch, cut across `v`, joined back: one
+    /// raised in `u` and the other given a `u` knot of its own, the second's
+    /// weights doubled, so the join brings them to one degree and one set
+    /// of knots and agrees their shared row's weights; the joined patch is
+    /// the patch, point for point. Pieces whose sides differ are refused.
+    #[test]
+    fn two_pieces_of_a_patch_cut_across_v_join_back_into_it() {
+        let w = core::f64::consts::FRAC_1_SQRT_2;
+        let points: Vec<_> = [
+            (Point::new(1.0, 0.0, 0.0), 1.0),
+            (Point::new(1.0, 1.0, 0.0), w),
+            (Point::new(0.0, 1.0, 0.0), 1.0),
+            (Point::new(1.0, 0.0, 1.0), 1.0),
+            (Point::new(1.0, 1.0, 1.0), w),
+            (Point::new(0.0, 1.0, 1.0), 1.0),
+        ]
+        .iter()
+        .map(|(p, w)| Weighted::new(*p, *w, T).unwrap())
+        .collect();
+        let whole = BSplineSurface::rational(
+            KnotVector::clamped_uniform(1, 2).unwrap(),
+            KnotVector::clamped_uniform(2, 3).unwrap(),
+            ControlGrid::new(points, 2, 3).unwrap(),
+        )
+        .unwrap();
+        let first = whole.segment((0.0, 1.0), (0.0, 0.4), T).unwrap();
+        let first = {
+            let mut runs = first.u_runs();
+            let mut knots = first.u_knots.clone();
+            for run in &mut runs {
+                let (k, c) = bspline::insert_knot(&first.u_knots, run, 0.3, 1, T).unwrap();
+                *run = c;
+                knots = k;
+            }
+            BSplineSurface::from_u_runs(knots, first.v_knots.clone(), &runs).unwrap()
+        };
+        let second = whole.segment((0.0, 1.0), (0.4, 1.0), T).unwrap();
+        let second = {
+            let mut runs = second.u_runs();
+            let mut knots = second.u_knots.clone();
+            for run in &mut runs {
+                let (k, c) = bspline::elevate_degree(&second.u_knots, run, T).unwrap();
+                *run = c
+                    .iter()
+                    .map(|p| Weighted {
+                        scaled: Point::from_vector(p.scaled.to_vector() * 2.0),
+                        weight: p.weight * 2.0,
+                    })
+                    .collect();
+                knots = k;
+            }
+            BSplineSurface::from_u_runs(knots, second.v_knots.clone(), &runs).unwrap()
+        };
+        let joined = first.joined_v(&second, T).unwrap();
+        assert_eq!(joined.v_knots.degree(), 2);
+        assert_eq!(joined.u_knots.degree(), 2);
+        for i in 0..=8 {
+            for j in 0..=10 {
+                let (u, v) = (f64::from(i) / 8.0, f64::from(j) / 10.0);
+                let d = joined
+                    .point_at(u, v, T)
+                    .unwrap()
+                    .distance(whole.point_at(u, v, T).unwrap());
+                assert!(d <= 1e-12, "({u}, {v}) off by {d}");
+                let back = whole.reversed_v().unwrap().point_at(u, 1.0 - v, T).unwrap();
+                assert!(back.distance(whole.point_at(u, v, T).unwrap()) <= 1e-12);
+                let moved = whole.reparameterized_v(-2.0, 0.0).unwrap();
+                let there = moved.point_at(u, 2.0 * v - 2.0, T).unwrap();
+                assert!(there.distance(whole.point_at(u, v, T).unwrap()) <= 1e-12);
+            }
+        }
+        assert!(first.joined_v(&first, T).is_err());
     }
 }
