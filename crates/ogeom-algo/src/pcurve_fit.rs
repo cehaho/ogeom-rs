@@ -259,6 +259,20 @@ pub fn fit_projected_pcurve_aimed(
     // cover it, so the model says what it knows instead of refusing to
     // triangulate. Judged after the retry, so a projection that stalled
     // cannot refuse an edge that is actually on its surface.
+    // A sample past the cap is landed again afresh before it refuses the
+    // edge: a projection seeded from its neighbour's foot can stall on a
+    // spline surface (along its border, an edge its section arc) well
+    // inside the slop the seeded landing accepts, yet past an edge's own
+    // tolerance.
+    for i in 0..offs.len() {
+        if offs[i] > cap
+            && let Ok(found) = crate::measure::project_on_surface(surface, points[i], 24, tol)
+            && found.distance < offs[i]
+        {
+            trace[i] = ogeom_math::Point2::new(found.parameters.0, found.parameters.1);
+            offs[i] = found.distance;
+        }
+    }
     let worst_off = offs.iter().copied().fold(0.0_f64, f64::max);
     if worst_off > cap {
         return Ok(CappedFit::TooFar(worst_off));
