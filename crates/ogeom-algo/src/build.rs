@@ -1126,7 +1126,11 @@ pub fn closed_at_poles(
         };
         ends.push((planar.point_at(t_start, tol)?, planar.point_at(t_end, tol)?));
     }
-    let collapses = |from: Point2, to: Point2| -> bool {
+    // The run stays at one point in space within `reach`: the confusion
+    // distance, or as far as the two edges and the vertex they meet at are
+    // known to (a file's edges stopping short of the pole, their vertex
+    // holding the gap).
+    let collapses = |from: Point2, to: Point2, reach: f64| -> bool {
         let Ok(at) = geometry.point_at(from.x, from.y, tol) else {
             return false;
         };
@@ -1135,7 +1139,7 @@ pub fn closed_at_poles(
             let p = Point2::new(from.x + (to.x - from.x) * s, from.y + (to.y - from.y) * s);
             geometry
                 .point_at(p.x, p.y, tol)
-                .is_ok_and(|q| q.distance(at) <= tol.confusion())
+                .is_ok_and(|q| q.distance(at) <= reach)
         })
     };
     // Each junction: whether the images meet there, or which pole run
@@ -1167,7 +1171,13 @@ pub fn closed_at_poles(
         ) else {
             return Ok(edges.to_vec());
         };
-        if arriving.node() != leaving.node() || !collapses(from, to) {
+        let mut reach = tol.confusion();
+        for shape in [edge, &edges[j], &arriving] {
+            if let Some(t) = model.tolerance_of(shape)? {
+                reach = reach.max(2.0 * t.get());
+            }
+        }
+        if arriving.node() != leaving.node() || !collapses(from, to, reach) {
             return Ok(edges.to_vec());
         }
         runs.push(Some((arriving, from, to)));
