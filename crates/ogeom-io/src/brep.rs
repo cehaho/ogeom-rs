@@ -1538,6 +1538,29 @@ pub fn read_numbered(text: &str, tol: Tolerances) -> OgeomResult<(Model, Shape, 
 /// any edge a file of ordinary size could hold, and the edge trims it.
 const OPEN_EXTENT: f64 = 1e6;
 
+/// The highest degree the format's Bezier records may carry, as its
+/// specification bounds them.
+const BEZIER_MAX_DEGREE: usize = 25;
+
+/// The knots that make a Bezier record the B-spline it is.
+///
+/// The format's Bezier curves (record 6, in two dimensions and three) carry
+/// a rational flag, a degree and `degree + 1` poles, and run over `[0, 1]`:
+/// a B-spline of one span whose ends each repeat `degree + 1` times reads
+/// the same poles the same way at every parameter, so the curve is built as
+/// that spline rather than approximated.
+fn bezier_knots(degree: usize) -> OgeomResult<KnotVector> {
+    if degree == 0 || degree > BEZIER_MAX_DEGREE {
+        ogeom_bail!(
+            Construction,
+            "a Bezier curve of degree {degree}; the format allows 1 to {BEZIER_MAX_DEGREE}"
+        );
+    }
+    let mut flat = vec![0.0; degree + 1];
+    flat.extend(std::iter::repeat_n(1.0, degree + 1));
+    KnotVector::new(flat, degree)
+}
+
 /// Everything read so far that later records refer to by number.
 #[derive(Default)]
 struct Built {
@@ -2378,6 +2401,18 @@ impl<'a> Cursor<'a> {
                 let hyperbola = Hyperbola::new(frame, self.number()?, self.number()?, tol)?;
                 HyperbolaCurve::new(hyperbola, OPEN_EXTENT)?.into()
             }
+            6 => {
+                let rational = self.flag()?;
+                let knots = bezier_knots(self.count()?)?;
+                let poles = knots.control_point_count();
+                let mut control = Vec::with_capacity(self.room(poles));
+                for _ in 0..poles {
+                    let at = self.point()?;
+                    let weight = if rational { self.number()? } else { 1.0 };
+                    control.push(Weighted::new(at, weight, tol)?);
+                }
+                BSplineCurve::rational(knots, control)?.into()
+            }
             7 => {
                 let rational = self.flag()?;
                 let _periodic = self.flag()?;
@@ -2409,8 +2444,7 @@ impl<'a> Cursor<'a> {
             }
             other => ogeom_bail!(
                 Construction,
-                "curve record {other} is one this does not read; a Bezier \
-                 curve is record 6, and nothing here builds one"
+                "curve record {other} is one this does not read"
             ),
         })
     }
@@ -2436,6 +2470,18 @@ impl<'a> Cursor<'a> {
                 let frame = self.seat2(tol)?;
                 let hyperbola = Hyperbola2::new(frame, self.number()?, self.number()?, tol)?;
                 ogeom_geom::Hyperbola2d::over(hyperbola, -OPEN_EXTENT, OPEN_EXTENT)?.into()
+            }
+            6 => {
+                let rational = self.flag()?;
+                let knots = bezier_knots(self.count()?)?;
+                let poles = knots.control_point_count();
+                let mut control = Vec::with_capacity(self.room(poles));
+                for _ in 0..poles {
+                    let at = self.point2()?;
+                    let weight = if rational { self.number()? } else { 1.0 };
+                    control.push(Weighted::new(at, weight, tol)?);
+                }
+                ogeom_geom::BSpline2d::rational(knots, control)?.into()
             }
             7 => {
                 let rational = self.flag()?;
