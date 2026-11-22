@@ -25,6 +25,11 @@
 //! orientation and placement, and edges carrying their curve, their pcurves
 //! and their seams.
 //!
+//! The reader also takes two spellings the writer never uses, each as the
+//! exact geometry it names: a Bezier curve, as the one-span B-spline it
+//! is, and a spline flagged periodic, unrolled and clamped over the period
+//! it states.
+//!
 //! No record carries a reversal, so a curve run backwards crosses as a
 //! forward curve through the same points in the same direction: a circle
 //! or an ellipse with its frame turned, a hyperbola or a parabola with its
@@ -65,7 +70,7 @@ use ogeom_geom::{
     SurfaceGeometry, TorusSurface, Transformable as _, Trimmed2d, TrimmedCurve, TrimmedSurface,
 };
 use ogeom_math::{
-    Axis, Axis2, Circle, Circle2, Cone, ControlGrid, Cylinder, Direction, Direction2, Ellipse,
+    Axis, Axis2, Blend, bspline, Circle, Circle2, Cone, ControlGrid, Cylinder, Direction, Direction2, Ellipse,
     Ellipse2, Frame, Frame2, Handedness, Hyperbola, Hyperbola2, KnotVector, Matrix3, Parabola,
     Plane, Point, Point2, Sphere, Torus, Transform, Transform2, TransformKind, Vector, Vector2,
     Weighted,
@@ -1585,6 +1590,158 @@ fn open_end(bound: f64, end: f64, open: f64) -> f64 {
     }
 }
 
+/// A spline record's knots as it writes them: each distinct value with its
+/// multiplicity, and whether the record calls the spline periodic.
+///
+/// A periodic record states one period and no more: its poles are a ring,
+/// its last knot closes the period at the multiplicity of its first, and
+/// the multiplicities of all the knots but the last sum to the number of
+/// poles. Its basis runs on past both ends, the knots repeating a period
+/// further on and the poles round the ring, so it is a different spelling
+/// from the clamped one the multiplicities would otherwise be read as.
+#[derive(Debug)]
+struct SplineKnots {
+    degree: usize,
+    distinct: Vec<(f64, usize)>,
+    periodic: bool,
+}
+
+impl SplineKnots {
+    /// The knots as one flat vector, each repeated its multiplicity.
+    fn flat(&self) -> OgeomResult<KnotVector> {
+        let mut flat = Vec::new();
+        for &(value, multiplicity) in &self.distinct {
+            flat.extend(std::iter::repeat_n(value, multiplicity));
+        }
+        KnotVector::new(flat, self.degree)
+    }
+
+    /// [`SplineKnots::unrolled`] for a curve's one run of poles.
+    fn unrolled_curve<P: Blend>(
+        &self,
+        poles: Vec<P>,
+        tol: Tolerances,
+    ) -> OgeomResult<(KnotVector, Vec<P>)> {
+        let (knots, runs) = self.unrolled(vec![poles], tol)?;
+        let Some(poles) = runs.into_iter().next() else {
+            ogeom_bail!(Construction, "a spline record with no poles");
+        };
+        Ok((knots, poles))
+    }
+
+    /// The knot vector, and each run of poles along it, of the spline the
+    /// record states, over the period it states.
+    ///
+    /// A record that is not periodic is read as written. A periodic one is
+    /// unrolled by as many knots past each end as its basis reaches, its
+    /// ring of poles continued round, which is the same spline exactly, and
+    /// then clamped at the period's ends by knot insertion, which moves
+    /// nothing: what comes back is a clamped spline over `[first, last]`
+    /// that agrees with the record at every parameter of that period.
+    fn unrolled<P: Blend>(
+        &self,
+        runs: Vec<Vec<P>>,
+        tol: Tolerances,
+    ) -> OgeomResult<(KnotVector, Vec<Vec<P>>)> {
+        if !self.periodic {
+            return Ok((self.flat()?, runs));
+        }
+        let degree = self.degree;
+        let (Some(&(lo, first)), Some(&(hi, last))) =
+            (self.distinct.first(), self.distinct.last())
+        else {
+            ogeom_bail!(Construction, "a periodic spline with no knots");
+        };
+        let period = hi - lo;
+        if self.distinct.len() < 2 || first != last || first == 0 || period.is_nan() || period <= 0.0
+        {
+            ogeom_bail!(
+                Construction,
+                "a periodic spline's knots must close a period, its last \
+                 knot at its first's multiplicity"
+            );
+        }
+        // One period's knots, the closing one left out: as many as the ring
+        // has poles.
+        let mut base = Vec::new();
+        for &(value, multiplicity) in &self.distinct[..self.distinct.len() - 1] {
+            base.extend(std::iter::repeat_n(value, multiplicity));
+        }
+        let ring = base.len();
+        for run in &runs {
+            if run.len() != ring {
+                ogeom_bail!(
+                    Dimension,
+                    "a periodic spline's knots describe {ring} poles, got {}",
+                    run.len()
+                );
+            }
+        }
+        // How far the basis over the period reaches past each end. A first
+        // knot at full multiplicity reaches nowhere: the record is clamped.
+        let reach = degree + 1 - first;
+        if reach == 0 {
+            return Ok((self.flat()?, runs));
+        }
+        // Behind the first knot, a period back at a time.
+        let mut flat = Vec::with_capacity(ring + first + 2 * reach);
+        let (mut at, mut shift) = (0, 0.0);
+        while flat.len() < reach {
+            if at == 0 {
+                at = ring;
+                shift -= period;
+            }
+            at -= 1;
+            flat.push(base[at] + shift);
+        }
+        flat.reverse();
+        flat.extend_from_slice(&base);
+        // The closing knot and on past it, a period on at a time.
+        let (mut at, mut shift) = (0, period);
+        for _ in 0..first + reach {
+            flat.push(base[at] + shift);
+            at += 1;
+            if at == ring {
+                at = 0;
+                shift += period;
+            }
+        }
+        let unrolled = KnotVector::new(flat, degree)?;
+        // Clamp each end: raise its knot to the degree, then drop the poles
+        // whose basis no longer reaches the period, and lay the one knot
+        // left outside on the end, where it enters no basis over the period.
+        let drop = reach - 1;
+        let mut knots = None;
+        let mut clamped = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut poles = run.clone();
+            poles.extend((0..reach).map(|i| run[i % ring]));
+            let (raised, poles) = bspline::insert_knot(&unrolled, &poles, lo, degree - first, tol)?;
+            let (raised, poles) = bspline::insert_knot(&raised, &poles, hi, degree - last, tol)?;
+            let (k, n) = (raised.knots(), poles.len());
+            if n <= 2 * drop + degree {
+                ogeom_bail!(Construction, "a periodic spline too short to clamp");
+            }
+            if knots.is_none() {
+                let mut k = k[drop..k.len() - drop].to_vec();
+                if let Some(start) = k.first_mut() {
+                    *start = lo;
+                }
+                if let Some(end) = k.last_mut() {
+                    *end = hi;
+                }
+                knots = Some(KnotVector::new(k, degree)?);
+            }
+            clamped.push(poles[drop..n - drop].to_vec());
+        }
+        let knots = match knots {
+            Some(knots) => knots,
+            None => self.flat()?,
+        };
+        Ok((knots, clamped))
+    }
+}
+
 /// The highest degree the format's Bezier records may carry, as its
 /// specification bounds them.
 const BEZIER_MAX_DEGREE: usize = 25;
@@ -2415,9 +2572,14 @@ impl<'a> Cursor<'a> {
         Frame2::from_axes(origin, x, y, tol)
     }
 
-    /// Poles and knots, as both spline records spell them.
-    fn spline_knots(&mut self, degree: usize, count: usize) -> OgeomResult<KnotVector> {
-        let mut flat = Vec::new();
+    /// Knots and their multiplicities, as every spline record spells them.
+    fn spline_knots(
+        &mut self,
+        degree: usize,
+        count: usize,
+        periodic: bool,
+    ) -> OgeomResult<SplineKnots> {
+        let mut distinct = Vec::with_capacity(self.room(count));
         for _ in 0..count {
             let value = self.number()?;
             let multiplicity = self.count()?;
@@ -2429,9 +2591,13 @@ impl<'a> Cursor<'a> {
                     "a knot of multiplicity {multiplicity} on a degree {degree} spline"
                 );
             }
-            flat.extend(std::iter::repeat_n(value, multiplicity));
+            distinct.push((value, multiplicity));
         }
-        KnotVector::new(flat, degree)
+        Ok(SplineKnots {
+            degree,
+            distinct,
+            periodic,
+        })
     }
 
     fn curve(&mut self, tol: Tolerances) -> OgeomResult<Curve> {
@@ -2482,7 +2648,7 @@ impl<'a> Cursor<'a> {
             }
             7 => {
                 let rational = self.flag()?;
-                let _periodic = self.flag()?;
+                let periodic = self.flag()?;
                 let degree = self.count()?;
                 let poles = self.count()?;
                 let knot_count = self.count()?;
@@ -2492,7 +2658,8 @@ impl<'a> Cursor<'a> {
                     let weight = if rational { self.number()? } else { 1.0 };
                     control.push(Weighted::new(at, weight, tol)?);
                 }
-                let knots = self.spline_knots(degree, knot_count)?;
+                let knots = self.spline_knots(degree, knot_count, periodic)?;
+                let (knots, control) = knots.unrolled_curve(control, tol)?;
                 BSplineCurve::rational(knots, control)?.into()
             }
             8 => {
@@ -2557,7 +2724,7 @@ impl<'a> Cursor<'a> {
             }
             7 => {
                 let rational = self.flag()?;
-                let _periodic = self.flag()?;
+                let periodic = self.flag()?;
                 let degree = self.count()?;
                 let poles = self.count()?;
                 let knot_count = self.count()?;
@@ -2567,7 +2734,8 @@ impl<'a> Cursor<'a> {
                     let weight = if rational { self.number()? } else { 1.0 };
                     control.push(Weighted::new(at, weight, tol)?);
                 }
-                let knots = self.spline_knots(degree, knot_count)?;
+                let knots = self.spline_knots(degree, knot_count, periodic)?;
+                let (knots, control) = knots.unrolled_curve(control, tol)?;
                 ogeom_geom::BSpline2d::rational(knots, control)?.into()
             }
             8 => {
@@ -2629,8 +2797,8 @@ impl<'a> Cursor<'a> {
             9 => {
                 let u_rational = self.flag()?;
                 let v_rational = self.flag()?;
-                let _u_periodic = self.flag()?;
-                let _v_periodic = self.flag()?;
+                let u_periodic = self.flag()?;
+                let v_periodic = self.flag()?;
                 let u_degree = self.count()?;
                 let v_degree = self.count()?;
                 let u_poles = self.count()?;
@@ -2647,9 +2815,23 @@ impl<'a> Cursor<'a> {
                     let weight = if rational { self.number()? } else { 1.0 };
                     points.push(Weighted::new(at, weight, tol)?);
                 }
-                let u_knots = self.spline_knots(u_degree, u_knot_count)?;
-                let v_knots = self.spline_knots(v_degree, v_knot_count)?;
-                let grid = ControlGrid::new(points, u_poles, v_poles)?;
+                let u_knots = self.spline_knots(u_degree, u_knot_count, u_periodic)?;
+                let v_knots = self.spline_knots(v_degree, v_knot_count, v_periodic)?;
+                // The poles run `v` fastest. Each direction is unrolled run
+                // by run: the `u` runs first, a column of the grid each, then
+                // the `v` runs of what that gives.
+                let columns = (0..v_poles)
+                    .map(|j| (0..u_poles).map(|i| points[i * v_poles + j]).collect())
+                    .collect();
+                let (u_knots, columns) = u_knots.unrolled(columns, tol)?;
+                let u_count = u_knots.control_point_count();
+                let rows = (0..u_count)
+                    .map(|i| columns.iter().map(|column| column[i]).collect())
+                    .collect();
+                let (v_knots, rows) = v_knots.unrolled(rows, tol)?;
+                let v_count = v_knots.control_point_count();
+                let points = rows.into_iter().flatten().collect();
+                let grid = ControlGrid::new(points, u_count, v_count)?;
                 BSplineSurface::rational(u_knots, v_knots, grid)?.into()
             }
             10 => {

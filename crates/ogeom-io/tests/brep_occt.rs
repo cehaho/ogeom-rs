@@ -336,3 +336,216 @@ fn a_trimmed_cone_reads_its_window_along_the_generator() {
         assert!((area - expected).abs() < 1e-3, "{surface}: {area} against {expected}");
     }
 }
+
+/// The ring of a circle of radius ten as a periodic rational quadratic:
+/// four quarter arcs, each opening on a pole on the circle, `w` the weight
+/// of the corner poles between them. Each pole is `x y` and its weight;
+/// `z` is put after `x y` when given.
+fn circle_ring(z: Option<&str>) -> String {
+    let w = "0.70710678118654757";
+    [
+        ("10", "0", "1"),
+        ("10", "10", w),
+        ("0", "10", "1"),
+        ("-10", "10", w),
+        ("-10", "0", "1"),
+        ("-10", "-10", w),
+        ("0", "-10", "1"),
+        ("10", "-10", w),
+    ]
+    .iter()
+    .map(|(x, y, weight)| match z {
+        Some(z) => format!("{x} {y} {z} {weight}"),
+        None => format!("{x} {y} {weight}"),
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+#[test]
+fn a_periodic_spline_reads_as_the_period_it_states() {
+    // A disc bounded by one closed edge, its curve and its chart the same
+    // periodic circle: eight poles over knots 0 to 4, each knot doubled,
+    // the multiplicities but the last's summing to the poles.
+    let knots = "0 2 1 2 2 2 3 2 4 2";
+    let text = format!(
+        "\
+DBRep_DrawableShape
+
+CASCADE Topology V3, (c) Open Cascade
+Locations 0
+Curve2ds 1
+7 1 1 2 8 5 {chart} {knots}
+Curves 1
+7 1 1 2 8 5 {curve} {knots}
+Polygon3D 0
+PolygonOnTriangulations 0
+Surfaces 1
+1 0 0 0 0 0 1 1 0 0 0 1 0
+Triangulations 0
+
+TShapes 4
+Ve
+1e-07
+10 0 0
+0 0
+
+0101101
+*
+Ed
+ 1e-07 1 1 0
+1 1 0 0 4
+2 1 1 0 0 4
+0
+
+0101000
++4 0 -4 0 *
+Wi
+
+0101100
++3 0 *
+Fa
+0 1e-07 1 0
+
+0111000
++2 0 *
+
++1 0
+",
+        chart = circle_ring(None),
+        curve = circle_ring(Some("0")),
+    );
+    let (model, face) = ogeom_io::brep::read(&text, T).unwrap();
+    let diagnosis = ogeom_algo::check(&model, &face, T).unwrap();
+    assert!(diagnosis.is_valid(), "{:?}", diagnosis.problems);
+    let area = ogeom_algo::surface_properties(
+        &model,
+        &face,
+        ogeom_mesh::Deflection::with_chord(1e-4).unwrap(),
+        T,
+    )
+    .unwrap()
+    .mass;
+    let disc = core::f64::consts::PI * 100.0;
+    assert!((area - disc).abs() < 1e-2, "a disc of radius ten: {area}");
+
+    // Every point of the curve read is on the circle, the period's ends
+    // and its middle on the poles the record puts there.
+    let (_, curve) = model.geometry().curves().next().unwrap();
+    for i in 0..=40 {
+        let u = 0.1 * f64::from(i);
+        let p = curve.point_at(u, T).unwrap();
+        assert!((p.x.hypot(p.y) - 10.0).abs() < 1e-9, "u = {u}: {p:?}");
+    }
+    assert!(curve.point_at(0.0, T).unwrap().is_equal(Point::new(10.0, 0.0, 0.0), T));
+    assert!(curve.point_at(2.0, T).unwrap().is_equal(Point::new(-10.0, 0.0, 0.0), T));
+    assert!(curve.point_at(4.0, T).unwrap().is_equal(Point::new(10.0, 0.0, 0.0), T));
+}
+
+#[test]
+fn a_surface_periodic_one_way_reads_as_its_period() {
+    // A cylinder of radius ten and height three, periodic round its `u`:
+    // the same ring as the circle at each of two heights, the poles running
+    // `v` fastest.
+    let low = circle_ring(Some("0"));
+    let high = circle_ring(Some("3"));
+    let low: Vec<&str> = low.split(' ').collect();
+    let high: Vec<&str> = high.split(' ').collect();
+    let mut net = Vec::new();
+    for (a, b) in low.chunks(4).zip(high.chunks(4)) {
+        net.push(a.join(" "));
+        net.push(b.join(" "));
+    }
+    let text = format!(
+        "\
+DBRep_DrawableShape
+
+CASCADE Topology V3, (c) Open Cascade
+Locations 0
+Curve2ds 0
+Curves 0
+Polygon3D 0
+PolygonOnTriangulations 0
+Surfaces 1
+9 1 1 1 0 2 1 8 2 5 2 {net} 0 2 1 2 2 2 3 2 4 2 0 2 1 2
+Triangulations 0
+
+TShapes 1
+Ve
+1e-07
+10 0 0
+0 0
+
+0101101
+*
+
++1 0
+",
+        net = net.join(" "),
+    );
+    let (model, _) = ogeom_io::brep::read(&text, T).unwrap();
+    let (_, surface) = model.geometry().surfaces().next().unwrap();
+    use ogeom_geom::Surface as _;
+    assert_eq!(surface.domain(), ((0.0, 4.0), (0.0, 1.0)));
+    for i in 0..=40 {
+        for j in 0..=4 {
+            let (u, v) = (0.1 * f64::from(i), 0.25 * f64::from(j));
+            let p = surface.point_at(u, v, T).unwrap();
+            assert!((p.x.hypot(p.y) - 10.0).abs() < 1e-9, "({u}, {v}): {p:?}");
+            assert!((p.z - 3.0 * v).abs() < 1e-9, "({u}, {v}): {p:?}");
+        }
+    }
+    let p = surface.point_at(1.0, 0.0, T).unwrap();
+    assert!(p.is_equal(Point::new(0.0, 10.0, 0.0), T), "{p:?}");
+}
+
+#[test]
+fn a_uniform_periodic_spline_reads_as_its_ring() {
+    // Simple knots: the basis reaches a full degree past each end, so the
+    // ring's first poles come round again after its last. The kernel's own
+    // periodic spline through the same ring is the same curve, its domain
+    // opening at the degree's knot rather than at zero.
+    let ring = [
+        Point::new(0.0, 0.0, 0.0),
+        Point::new(4.0, 1.0, 0.0),
+        Point::new(5.0, 5.0, 1.0),
+        Point::new(1.0, 6.0, 2.0),
+        Point::new(-2.0, 3.0, 1.0),
+    ];
+    let poles: Vec<String> = ring.iter().map(|p| format!("{} {} {}", p.x, p.y, p.z)).collect();
+    let text = format!(
+        "\
+DBRep_DrawableShape
+
+CASCADE Topology V3, (c) Open Cascade
+Locations 0
+Curve2ds 0
+Curves 1
+7 0 1 3 5 6 {} 0 1 1 1 2 1 3 1 4 1 5 1
+Polygon3D 0
+PolygonOnTriangulations 0
+Surfaces 0
+Triangulations 0
+
+TShapes 1
+Ve
+1e-07
+0 0 0
+0 0
+
+0101101
+*
+
++1 0
+",
+        poles.join(" ")
+    );
+    let (model, _) = ogeom_io::brep::read(&text, T).unwrap();
+    let (_, curve) = model.geometry().curves().next().unwrap();
+    let own = ogeom_geom::BSplineCurve::periodic(&ring, 3, T).unwrap();
+    for i in 0..=50 {
+        let u = 0.1 * f64::from(i);
+        let (read, expected) = (curve.point_at(u, T).unwrap(), own.point_at(u + 3.0, T).unwrap());
+        assert!(read.distance(expected) < 1e-12, "u = {u}: {read:?} against {expected:?}");
+    }
+}
