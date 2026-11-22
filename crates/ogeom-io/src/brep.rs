@@ -1536,7 +1536,54 @@ pub fn read_numbered(text: &str, tol: Tolerances) -> OgeomResult<(Model, Shape, 
 /// no parameter window; the window is the *edge's* business, and every edge
 /// states its own range. So the curve is built over a window wide enough for
 /// any edge a file of ordinary size could hold, and the edge trims it.
+/// A line's record is the same. Where a trimmed record states a window
+/// around one, the window is the file's own word on how far the curve
+/// runs, and the curve is built to reach at least that far ([`reaching`]).
 const OPEN_EXTENT: f64 = 1e6;
+
+/// The window an unbounded curve is built over beneath a trimmed record
+/// that keeps `[lo, hi]` of it: the usual one, widened to the trim's.
+///
+/// The widening only ever answers the file: it reaches no further than
+/// the trim the file states, and a trim that leaves a curve's own domain
+/// (a spline's knots, a conic's period) is still refused.
+fn reaching(lo: f64, hi: f64) -> (f64, f64) {
+    (lo.min(-OPEN_EXTENT), hi.max(OPEN_EXTENT))
+}
+
+/// The window an unbounded surface is read over, in each open direction.
+///
+/// An unbounded carrier needs a window to live in; the format gives none,
+/// so one wide enough for anything the file can hold is used, and the
+/// face's own trim is what bounds it in practice.
+const REACH: (f64, f64) = (-1e9, 1e9);
+
+/// What the format writes for a bound that is none.
+///
+/// A surface trimmed in one direction only is still written with four
+/// bounds, the untrimmed direction's being the writing kernel's own
+/// infinity, `2e100`. That is no window at all, so it is read as the
+/// carrier's own (see [`open_end`]).
+const INFINITE: f64 = 2e100;
+
+/// A trimmed surface's bound `bound` against its carrier's end `end` in
+/// the same direction, `open` being that end's sign and size where the
+/// carrier is read unbounded.
+///
+/// A bound at the format's infinity over a carrier read unbounded there
+/// says the direction is not trimmed, and is read as the carrier's own end.
+/// Every other bound is kept as written, so a finite trim past a carrier's
+/// domain, or an infinite one over a bounded carrier, is still refused.
+fn open_end(bound: f64, end: f64, open: f64) -> f64 {
+    // A carrier read unbounded ends at the window it was read over: a
+    // surface's own, or the open window of the curve a sweep was built on.
+    let unbounded = end == open || end == open.signum() * OPEN_EXTENT;
+    if bound.abs() >= INFINITE && bound.signum() == open.signum() && unbounded {
+        end
+    } else {
+        bound
+    }
+}
 
 /// The highest degree the format's Bezier records may carry, as its
 /// specification bounds them.
@@ -1716,9 +1763,24 @@ impl Built {
             Some((upright, turned)) => (upright, true, turned),
             None => (surface, false, false),
         };
-        let v_scale = match &surface {
+        let cone_scale = |surface: &SurfaceGeometry| match surface {
             SurfaceGeometry::Cone(c) => c.cone().half_angle().cos(),
             _ => 1.0,
+        };
+        let v_scale = match &surface {
+            SurfaceGeometry::Trimmed(t) => cone_scale(t.basis()),
+            other => cone_scale(other),
+        };
+        // A trimmed cone's window is in the file's `v` too, measured along
+        // the generator like its charts, and is carried the same way.
+        let (surface, rebuilt) = match surface {
+            SurfaceGeometry::Trimmed(t) if v_scale != 1.0 => {
+                let (u, v) = t.domain();
+                let window = (v.0 * v_scale, v.1 * v_scale);
+                let trimmed = TrimmedSurface::new(t.basis().clone(), u, window, tol)?;
+                (SurfaceGeometry::Trimmed(Box::new(trimmed)), true)
+            }
+            other => (other, rebuilt),
         };
         let placed = if moved || rebuilt {
             model.geometry_mut().add_surface(surface)
@@ -2373,6 +2435,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn curve(&mut self, tol: Tolerances) -> OgeomResult<Curve> {
+        self.curve_over((-OPEN_EXTENT, OPEN_EXTENT), tol)
+    }
+
+    /// A curve record, an unbounded line or conic in it built over `reach`.
+    fn curve_over(&mut self, reach: (f64, f64), tol: Tolerances) -> OgeomResult<Curve> {
         let kind = self.count()?;
         Ok(match kind {
             1 => {
@@ -2380,7 +2447,7 @@ impl<'a> Cursor<'a> {
                 let direction = self.direction(tol)?;
                 // The record carries no window; the edge's own range is what
                 // bounds it, so the curve is built wide and trimmed there.
-                LineCurve::over(Axis::new(origin, direction), -OPEN_EXTENT, OPEN_EXTENT)?.into()
+                LineCurve::over(Axis::new(origin, direction), reach.0, reach.1)?.into()
             }
             2 => {
                 let frame = self.seat(tol)?;
@@ -2394,12 +2461,12 @@ impl<'a> Cursor<'a> {
             4 => {
                 let frame = self.seat(tol)?;
                 let parabola = Parabola::new(frame, self.number()?, tol)?;
-                ParabolaCurve::new(parabola, OPEN_EXTENT)?.into()
+                ParabolaCurve::over(parabola, reach.0, reach.1)?.into()
             }
             5 => {
                 let frame = self.seat(tol)?;
                 let hyperbola = Hyperbola::new(frame, self.number()?, self.number()?, tol)?;
-                HyperbolaCurve::new(hyperbola, OPEN_EXTENT)?.into()
+                HyperbolaCurve::over(hyperbola, reach.0, reach.1)?.into()
             }
             6 => {
                 let rational = self.flag()?;
@@ -2431,13 +2498,13 @@ impl<'a> Cursor<'a> {
             8 => {
                 let lo = self.number()?;
                 let hi = self.number()?;
-                let basis = self.curve(tol)?;
+                let basis = self.curve_over(reaching(lo, hi), tol)?;
                 Curve::Trimmed(Box::new(TrimmedCurve::new(basis, lo, hi, tol)?))
             }
             9 => {
                 let distance = self.number()?;
                 let reference = self.direction(tol)?;
-                let basis = self.curve(tol)?;
+                let basis = self.curve_over(reach, tol)?;
                 Curve::Offset(Box::new(ogeom_geom::OffsetCurve::new(
                     basis, distance, reference,
                 )?))
@@ -2450,12 +2517,17 @@ impl<'a> Cursor<'a> {
     }
 
     fn pcurve(&mut self, tol: Tolerances) -> OgeomResult<PlanarCurve> {
+        self.pcurve_over((-OPEN_EXTENT, OPEN_EXTENT), tol)
+    }
+
+    /// A chart curve record, as [`Cursor::curve_over`].
+    fn pcurve_over(&mut self, reach: (f64, f64), tol: Tolerances) -> OgeomResult<PlanarCurve> {
         let kind = self.count()?;
         Ok(match kind {
             1 => {
                 let origin = self.point2()?;
                 let direction = self.direction2(tol)?;
-                Line2d::over(Axis2::new(origin, direction), -OPEN_EXTENT, OPEN_EXTENT)?.into()
+                Line2d::over(Axis2::new(origin, direction), reach.0, reach.1)?.into()
             }
             2 => {
                 let frame = self.seat2(tol)?;
@@ -2469,7 +2541,7 @@ impl<'a> Cursor<'a> {
             5 => {
                 let frame = self.seat2(tol)?;
                 let hyperbola = Hyperbola2::new(frame, self.number()?, self.number()?, tol)?;
-                ogeom_geom::Hyperbola2d::over(hyperbola, -OPEN_EXTENT, OPEN_EXTENT)?.into()
+                ogeom_geom::Hyperbola2d::over(hyperbola, reach.0, reach.1)?.into()
             }
             6 => {
                 let rational = self.flag()?;
@@ -2501,12 +2573,12 @@ impl<'a> Cursor<'a> {
             8 => {
                 let lo = self.number()?;
                 let hi = self.number()?;
-                let basis = self.pcurve(tol)?;
+                let basis = self.pcurve_over(reaching(lo, hi), tol)?;
                 PlanarCurve::Trimmed(Box::new(ogeom_geom::Trimmed2d::new(basis, lo, hi, tol)?))
             }
             9 => {
                 let distance = self.number()?;
-                let basis = self.pcurve(tol)?;
+                let basis = self.pcurve_over(reach, tol)?;
                 PlanarCurve::Offset(Box::new(ogeom_geom::Offset2d::new(basis, distance)?))
             }
             other => ogeom_bail!(
@@ -2518,10 +2590,6 @@ impl<'a> Cursor<'a> {
 
     fn surface(&mut self, tol: Tolerances) -> OgeomResult<SurfaceGeometry> {
         let kind = self.count()?;
-        // An unbounded carrier needs a window to live in; the format gives
-        // none, so one wide enough for anything the file can hold is used,
-        // and the face's own trim is what bounds it in practice.
-        const REACH: (f64, f64) = (-1e9, 1e9);
         Ok(match kind {
             1 => {
                 let frame = self.seat(tol)?;
@@ -2588,6 +2656,9 @@ impl<'a> Cursor<'a> {
                 let u = (self.number()?, self.number()?);
                 let v = (self.number()?, self.number()?);
                 let basis = self.surface(tol)?;
+                let ((ua, ub), (va, vb)) = basis.domain();
+                let u = (open_end(u.0, ua, REACH.0), open_end(u.1, ub, REACH.1));
+                let v = (open_end(v.0, va, REACH.0), open_end(v.1, vb, REACH.1));
                 SurfaceGeometry::Trimmed(Box::new(TrimmedSurface::new(basis, u, v, tol)?))
             }
             11 => {

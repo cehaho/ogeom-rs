@@ -156,3 +156,183 @@ fn bezier_curves_read_as_the_splines_they_are() {
     let text = square("6 0 26 0 0 10 0", "1 0 0 0 1 0 0", ("0", "10"));
     assert!(ogeom_io::brep::read(&text, T).is_err());
 }
+
+#[test]
+fn a_trim_wider_than_the_open_window_reads() {
+    // A line has no window of its own; the trim around it is the file's
+    // word on how far it runs, here twenty times past the window a bare
+    // line is read over, in both tables.
+    let text = square(
+        "8 -20000000 20000000\n1 0 0 1 0",
+        "8 -20000000 20000000\n1 0 0 0 1 0 0",
+        ("0", "10"),
+    );
+    read_square(&text);
+
+    // A curve that has a domain of its own still holds the trim to it: a
+    // spline over [0, 1] trimmed to [-1, 2] is refused.
+    let text = square(
+        "8 -1 2\n7 0 0 1 2 2 0 0 10 0 0 2 1 2",
+        "1 0 0 0 1 0 0",
+        ("0", "10"),
+    );
+    let refused = ogeom_io::brep::read(&text, T).unwrap_err().to_string();
+    assert!(refused.contains("trim range"), "{refused}");
+}
+
+#[test]
+fn a_surface_trimmed_one_way_reads_its_other_way_open() {
+    // The writing kernel spells a direction left untrimmed with its own
+    // infinity: the plane here is trimmed in v only.
+    let plane = "Surfaces 1
+1 0 0 0 0 0 1 1 0 0 0 1 0";
+    let square_on = |surface: &str| {
+        square("1 0 0 1 0", "1 0 0 0 1 0 0", ("0", "10")).replace(plane, surface)
+    };
+    read_square(&square_on(
+        "Surfaces 1
+10 -2e+100 2e+100 -5 15
+1 0 0 0 0 0 1 1 0 0 0 1 0",
+    ));
+
+    // A finite bound past the window a plane is read over is a trim, and
+    // still refused.
+    let refused = ogeom_io::brep::read(
+        &square_on("Surfaces 1
+10 -2e+100 2e+100 -5 2e9
+1 0 0 0 0 0 1 1 0 0 0 1 0"),
+        T,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("v range"), "{refused}");
+}
+
+/// A quarter of a cone's band, `u` over `[0, pi/2]` and `v` over `[0, 2]`
+/// along the generator, on the surface record `surface`.
+fn cone_band(surface: &str) -> String {
+    format!(
+        "\
+DBRep_DrawableShape
+
+CASCADE Topology V3, (c) Open Cascade
+Locations 0
+Curve2ds 4
+1 0 0 1 0
+1 1.5707963267948966 0 0 1
+1 0 2 1 0
+1 0 0 0 1
+Curves 4
+2 0 0 0 0 0 1 1 0 0 0 1 0 10
+1 0 10 0 0 0.70710678118654757 0.70710678118654757
+2 0 0 1.4142135623730951 0 0 1 1 0 0 0 1 0 11.414213562373096
+1 10 0 0 0.70710678118654757 0 0.70710678118654757
+Polygon3D 0
+PolygonOnTriangulations 0
+Surfaces 1
+{surface}
+Triangulations 0
+
+TShapes 10
+Ve
+1e-07
+10 0 0
+0 0
+
+0101101
+*
+Ve
+1e-07
+0 10 0
+0 0
+
+0101101
+*
+Ed
+ 1e-07 1 1 0
+1 1 0 0 1.5707963267948966
+2 1 1 0 0 1.5707963267948966
+0
+
+0101000
++10 0 -9 0 *
+Ve
+1e-07
+0 11.414213562373096 1.4142135623730951
+0 0
+
+0101101
+*
+Ed
+ 1e-07 1 1 0
+1 2 0 0 2
+2 2 1 0 0 2
+0
+
+0101000
++9 0 -7 0 *
+Ve
+1e-07
+11.414213562373096 0 1.4142135623730951
+0 0
+
+0101101
+*
+Ed
+ 1e-07 1 1 0
+1 3 0 0 1.5707963267948966
+2 3 1 0 0 1.5707963267948966
+0
+
+0101000
++5 0 -7 0 *
+Ed
+ 1e-07 1 1 0
+1 4 0 0 2
+2 4 1 0 0 2
+0
+
+0101000
++10 0 -5 0 *
+Wi
+
+0101100
++8 0 +6 0 -4 0 -3 0 *
+Fa
+0 1e-07 1 0
+
+0111000
++2 0 *
+
++1 0
+"
+    )
+}
+
+#[test]
+fn a_trimmed_cone_reads_its_window_along_the_generator() {
+    // The format measures a cone's `v` along its generator, and so does a
+    // trim around one: a band trimmed to [-1, 3] of that `v`, or trimmed in
+    // `u` alone, is the same band as on the bare cone.
+    let cone = "3 0 0 0 0 0 1 1 0 0 0 1 0 10 0.78539816339744828";
+    // (pi / 2) times the mean radius 10 + sin(pi / 4), times the width 2.
+    let expected = core::f64::consts::FRAC_PI_2 * (20.0 + 2.0_f64.sqrt());
+    for surface in [
+        cone.to_string(),
+        format!("10 0 6.2831853071795862 -1 3\n{cone}"),
+        format!("10 0 6.2831853071795862 -2e+100 2e+100\n{cone}"),
+    ] {
+        let (model, face) = ogeom_io::brep::read(&cone_band(&surface), T).unwrap();
+        let diagnosis = ogeom_algo::check(&model, &face, T).unwrap();
+        assert!(diagnosis.is_valid(), "{surface}: {:?}", diagnosis.problems);
+        let area = ogeom_algo::surface_properties(
+            &model,
+            &face,
+            ogeom_mesh::Deflection::with_chord(1e-4).unwrap(),
+            T,
+        )
+        .unwrap()
+        .mass;
+        assert!((area - expected).abs() < 1e-3, "{surface}: {area} against {expected}");
+    }
+}
